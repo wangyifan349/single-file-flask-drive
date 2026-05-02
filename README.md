@@ -2,13 +2,7 @@
 
 **Single File Flask Drive** is a compact, self-hosted cloud drive written as one deployable Python file: `app.py`.
 
-The suggested GitHub repository name is:
-
-```text
-single-file-flask-drive
-```
-
-Suggested repository URL:
+Repository:
 
 ```text
 https://github.com/wangyifan349/single-file-flask-drive
@@ -18,21 +12,23 @@ This project is designed for people who want a practical file manager that is ea
 
 ## ✨ What it does
 
-`app.py` starts a complete web-based cloud drive service. It supports account management, hierarchical folders, uploads, downloads, sharing, share cancellation, online media playback, and online plain-text editing.
+`app.py` starts a complete web-based cloud drive service.
 
-It stores metadata in SQLite and stores uploaded file content on disk. Folder downloads are generated as temporary `.7z` archives on disk, instead of being loaded as one large in-memory archive. This makes large folder downloads more stable and more suitable for real-world use.
+It supports user accounts, hierarchical folders, file and folder upload, file and folder download, file sharing, folder sharing, share management, online audio playback, online video playback, online plain-text editing, and read-only text viewing from shared pages.
+
+Metadata is stored in SQLite, while uploaded file content is stored on disk. Folder downloads are generated as temporary `.7z` archives on disk instead of being loaded as one large in-memory archive. This makes large folder downloads more stable and more suitable for real-world usage.
 
 ## ✅ Project status
 
 This package is intended to be directly usable.
 
-The project has passed practical smoke testing, including application startup, registration, authenticated drive access, folder creation, file upload, file download, folder archive generation, sharing, shared browsing, and embedded static asset loading.
+The current packaged version has passed practical smoke testing, including application startup, registration, login, authenticated drive access, folder creation, file upload, file download, folder archive generation, sharing, shared folder browsing, shared file access, and embedded static asset loading.
 
 For production use, you should still deploy it behind HTTPS, set a stable `SECRET_KEY`, and back up the data directory regularly.
 
 ## 🚀 Main features
 
-### 👤 Account features
+### 👤 Account management
 
 - User registration.
 - User login.
@@ -43,7 +39,7 @@ For production use, you should still deploy it behind HTTPS, set a stable `SECRE
 
 ### 📁 File and folder management
 
-- Hierarchical folders.
+- Hierarchical folder structure.
 - Breadcrumb navigation.
 - File upload.
 - Folder upload.
@@ -58,48 +54,73 @@ For production use, you should still deploy it behind HTTPS, set a stable `SECRE
 - Drag-and-drop movement into folders.
 - Drag-and-drop movement into breadcrumb destinations.
 - Right-click context menus for file, folder, and blank-area actions.
+- Visually distinct square icons for folders, files, text files, audio files, and video files.
 
-### 🔗 Sharing features
+### 🔗 Sharing
+
+Sharing is one of the main features of this project.
 
 - Share individual files.
 - Share entire folders.
 - Copy share links from the browser.
-- Share management page.
+- Manage all created shares from the share management page.
 - Cancel existing shares.
 - Browse shared folders.
 - Download shared files.
 - Download shared folders as `.7z` archives.
-- Shared folder pages preserve the same basic browsing behavior: click folders to enter and click files to download.
+- Shared folder pages keep the same simple browsing behavior: click folders to enter and click files to download.
 
-### 🎵 Audio and video playback
+### 🎵 Online audio playback
 
-- Online audio playback.
-- Online video playback.
-- Playback opens in a separate browser tab.
-- Shared audio and video files can also be played online.
-- Shared media files can still be downloaded.
+Audio files can be played directly in the browser.
 
-### 📝 Online text editing and viewing
+- Signed-in users can right-click supported audio files and open playback in a new tab.
+- Shared audio files can also be played online from the share page.
+- Shared audio files can still be downloaded normally.
+- Playback uses browser-native media controls.
 
-- Signed-in users can edit plain-text files online.
-- Shared plain-text files can be viewed online in read-only mode.
+### 🎬 Online video playback
+
+Video files can be played directly in the browser.
+
+- Signed-in users can right-click supported video files and open playback in a new tab.
+- Shared video files can also be played online from the share page.
+- Shared video files can still be downloaded normally.
+- Playback uses browser-native media controls.
+
+### 📝 Online plain-text editing
+
+Signed-in users can edit plain-text files online.
+
 - Text editing opens in a separate browser tab.
-- The editor is large and screen-focused.
-- The editor supports preserving indentation and line breaks.
+- The editor is large and focused on screen space.
+- The editor preserves indentation and line breaks.
 - `Tab` inserts indentation while editing.
 - `Ctrl + S` / `Command + S` saves text.
 - The app detects BOM and common text encodings.
 - The app tries to preserve the original encoding and newline style when saving.
 
+### 👀 Shared plain-text viewing
+
+Shared text files can be viewed online in read-only mode.
+
+- Shared text viewing opens in a separate browser tab.
+- The interface is similar to the editor.
+- Shared users can view and download the text file.
+- Shared users cannot modify or save the file.
+- This is useful for sharing logs, notes, Markdown documents, code snippets, configuration files, and plain-text articles.
+
 ### 🗜️ Archive download behavior
 
-- Folder downloads are generated as `.7z` files.
+Folder downloads are generated as `.7z` files.
+
 - The app uses `py7zr` for high-compression archive generation.
 - Archive files are written to a temporary archive directory on disk.
 - The browser waits while the server prepares the archive.
 - After the archive is ready, the browser starts the download.
 - Temporary archives are automatically cleaned up after the configured retention period.
 - The default archive retention time is one day.
+- The archive workflow avoids loading the whole archive into memory at once.
 
 ### 🖥️ Interface behavior
 
@@ -109,6 +130,7 @@ For production use, you should still deploy it behind HTTPS, set a stable `SECRE
 - Right-click menus are used for most drive actions.
 - File and folder icons are visually distinct.
 - The main file browser uses the screen space directly and avoids heavy container borders.
+- Media preview, text editing, and shared text viewing open in separate tabs so the current file list is not replaced.
 
 ## 📦 Repository contents
 
@@ -118,12 +140,11 @@ single-file-flask-drive/
   README.md          # Project documentation
   LICENSE            # GNU General Public License v3.0
   requirements.txt   # pip dependency list
-  DEPENDENCIES.md    # Human-readable dependency notes
 ```
 
-## 🧩 Dependency list
+## 🧩 Dependencies
 
-The runtime dependencies are intentionally small:
+The runtime dependency list is intentionally small.
 
 ```text
 flask
@@ -131,7 +152,17 @@ py7zr
 charset-normalizer
 ```
 
-Install them with:
+### Dependency roles
+
+| Dependency | Why it is used |
+|---|---|
+| `flask` | Web server, routing, sessions, request handling, response handling, and template rendering. |
+| `py7zr` | Generates `.7z` archives for folder downloads. |
+| `charset-normalizer` | Helps detect text encodings when opening plain-text files for editing or read-only viewing. |
+
+### Install dependencies
+
+Install the dependencies with:
 
 ```bash
 pip install flask py7zr charset-normalizer
@@ -143,32 +174,36 @@ Or install from the included dependency file:
 pip install -r requirements.txt
 ```
 
-## 🛠️ Create the GitHub repository
-
-Create a new repository under your GitHub account with this name:
+### Suggested `requirements.txt`
 
 ```text
-single-file-flask-drive
-```
-
-Your repository URL will be:
-
-```text
-https://github.com/wangyifan349/single-file-flask-drive
+flask
+py7zr
+charset-normalizer
 ```
 
 ## 📥 Clone and run
 
-After the repository is created and pushed to GitHub, deploy from `git clone` like this:
+Clone the repository:
 
 ```bash
 git clone https://github.com/wangyifan349/single-file-flask-drive.git
 cd single-file-flask-drive
+```
+
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
+```
+
+Run the app:
+
+```bash
 python app.py
 ```
 
-Then open:
+Open the app in your browser:
 
 ```text
 http://127.0.0.1:5000
@@ -176,7 +211,9 @@ http://127.0.0.1:5000
 
 ## 🧪 Recommended local setup
 
-A virtual environment is recommended:
+A virtual environment is recommended.
+
+### Linux / macOS
 
 ```bash
 git clone https://github.com/wangyifan349/single-file-flask-drive.git
@@ -187,7 +224,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-On Windows PowerShell:
+### Windows PowerShell
 
 ```powershell
 git clone https://github.com/wangyifan349/single-file-flask-drive.git
@@ -198,18 +235,26 @@ pip install -r requirements.txt
 python app.py
 ```
 
+Then open:
+
+```text
+http://127.0.0.1:5000
+```
+
 ## 🌐 Simple deployment notes
 
-The simplest deployment is just:
+The simplest deployment is:
 
 ```bash
+git clone https://github.com/wangyifan349/single-file-flask-drive.git
+cd single-file-flask-drive
 pip install -r requirements.txt
 python app.py
 ```
 
-For a long-running server, run the app behind a process manager or WSGI server of your choice. The application itself does not require Node.js, npm, Vite, React, Vue, a template directory, or a static directory.
+The application itself does not require Node.js, npm, Vite, React, Vue, a template directory, or a static directory.
 
-For public deployment, use HTTPS and set a stable `SECRET_KEY`.
+For a long-running server, run the app behind a process manager or WSGI server of your choice. For public deployment, use HTTPS and set a stable `SECRET_KEY`.
 
 ## ⚙️ Environment variables
 
@@ -318,6 +363,16 @@ This project includes practical security measures for a small self-hosted drive:
 - Random salt generation for password hashing.
 
 For stronger production security, consider using a dedicated password hashing algorithm such as Argon2id or bcrypt, running only behind HTTPS, adding rate limiting, adding account lockout rules, and placing the app behind a mature reverse proxy.
+
+## ☕ Support the author
+
+If this project helps you and you would like to say thanks, you can buy me a coffee. I really appreciate it.
+
+Bitcoin:
+
+```text
+bc1q.........
+```
 
 ## 🧾 License
 
