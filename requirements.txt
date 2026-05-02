@@ -1,3 +1,4 @@
 flask
 py7zr
 charset-normalizer
+requests
