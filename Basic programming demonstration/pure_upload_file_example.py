@@ -3,1589 +3,973 @@ This program is a single-file Flask file manager that combines the frontend and 
 The program is designed for teaching and practical local deployment. It includes strong fault tolerance for unstable network conditions, browser-side SHA-256 verification, backend hash validation, safe temporary upload handling, and disk-based archive buffering. For downloading folders or multiple selected items, it creates compressed .7z archives in a temporary buffer directory before sending them to the browser, avoiding in-memory archive generation and supporting efficient compressed downloads.
 pip install flask py7zr
 """
+
 from __future__ import annotations
 
 import hashlib
-import lzma
+import json
 import os
 import re
 import shutil
-import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+
 import py7zr
-from flask import Flask, jsonify, render_template_string, request, send_file, send_from_directory
+from flask import Flask, Response, jsonify, render_template_string, request, send_file, send_from_directory
+
 app = Flask(__name__)
-# Paths and runtime settings.
-# The application stores user files under STORAGE_ROOT only.
-# Temporary upload files and generated 7z archives are stored under BUFFER_ROOT.
-# Keeping generated archives on disk avoids holding large compressed payloads in RAM.
-BASE_DIRECTORY = Path(__file__).resolve().parent
-STORAGE_ROOT = (BASE_DIRECTORY / "storage").resolve()
-BUFFER_ROOT = (BASE_DIRECTORY / "file_manager_buffer").resolve()
-UPLOAD_BUFFER_ROOT = (BUFFER_ROOT / "uploads").resolve()
-ARCHIVE_BUFFER_ROOT = (BUFFER_ROOT / "archives").resolve()
 
+BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = (BASE_DIR / "storage").resolve()
+BUFFER_DIR = (BASE_DIR / "file_manager_buffer").resolve()
+UPLOAD_BUFFER_DIR = (BUFFER_DIR / "uploads").resolve()
+ARCHIVE_BUFFER_DIR = (BUFFER_DIR / "archives").resolve()
+
+# py7zr 最大压缩参数。LZMA2 preset=9 是 py7zr/lzma 侧的最高预设等级。
+PY7ZR_PRESET = int(os.environ.get("PY7ZR_PRESET", "9"))
 ARCHIVE_MAX_AGE_SECONDS = int(os.environ.get("ARCHIVE_MAX_AGE_SECONDS", str(6 * 60 * 60)))
-PY7ZR_PRESET_LEVEL = max(0, min(9, int(os.environ.get("PY7ZR_PRESET", "9"))))
-PY7ZR_EXTREME_MODE = os.environ.get("PY7ZR_EXTREME", "1") not in {"0", "false", "False", "no", "NO"}
 
-for required_directory in (STORAGE_ROOT, UPLOAD_BUFFER_ROOT, ARCHIVE_BUFFER_ROOT):
-    required_directory.mkdir(parents=True, exist_ok=True)
+for p in (ROOT_DIR, UPLOAD_BUFFER_DIR, ARCHIVE_BUFFER_DIR):
+    p.mkdir(parents=True, exist_ok=True)
 
-INVALID_PATH_SEGMENT_PATTERN = re.compile(r'[<>:"|?*\x00-\x1f]')
-ARCHIVE_JOB_PATTERN = re.compile(r"^[a-f0-9]{32}$")
-SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
-STORAGE_WRITE_LOCK = threading.RLock()
+BAD_SEGMENT_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
 
 
-# JSON API error handling.
-# ApiError gives every route a consistent JSON failure shape.
-# This keeps frontend error handling simple because every API error has an "ok": false body.
 class ApiError(Exception):
-    def __init__(self, message: str, status_code: int = 400):
+    def __init__(self, message: str, status: int = 400):
         self.message = message
-        self.status_code = status_code
+        self.status = status
         super().__init__(message)
 
 
 @app.errorhandler(ApiError)
-def handle_api_error(error: ApiError):
-    return jsonify({"ok": False, "error": error.message}), error.status_code
-
-def raise_api_error(message: str, status_code: int = 400):
-    raise ApiError(message, status_code)
+def handle_api_error(exc: ApiError):
+    return jsonify({"ok": False, "error": exc.message}), exc.status
 
 
-# Path normalization keeps every operation inside STORAGE_ROOT.
-# Each user-supplied path is split into safe path segments and resolved against STORAGE_ROOT.
-# This prevents path traversal such as "../" from escaping the managed storage directory.
-def normalize_path_segment(path_segment: str) -> str:
-    cleaned_segment = INVALID_PATH_SEGMENT_PATTERN.sub("_", path_segment.strip())
-    if not cleaned_segment or cleaned_segment in {".", ".."}:
-        raise_api_error("Invalid file or directory name")
-    return cleaned_segment
+def fail(message: str, status: int = 400):
+    raise ApiError(message, status)
 
 
-def normalize_relative_path(raw_path: str | None, *, allow_empty: bool = True) -> str:
-    if raw_path is None:
+def sanitize_segment(segment: str) -> str:
+    segment = segment.strip()
+    segment = BAD_SEGMENT_CHARS.sub("_", segment)
+    if not segment or segment in {".", ".."}:
+        fail("非法文件名")
+    return segment
+
+
+def clean_rel_path(raw: str | None, *, allow_empty: bool = True) -> str:
+    if raw is None:
+        return "" if allow_empty else fail("路径不能为空")
+    raw = str(raw).replace("\\", "/").strip()
+    raw = raw.lstrip("/")
+    if raw in {"", "."}:
         if allow_empty:
             return ""
-        raise_api_error("Path cannot be empty")
-    normalized_path = str(raw_path).replace("\\", "/").strip().lstrip("/")
-    if normalized_path in {"", "."}:
-        if allow_empty:
-            return ""
-        raise_api_error("Path cannot be empty")
-    normalized_segments: list[str] = []
-    for raw_segment in normalized_path.split("/"):
-        if raw_segment in {"", "."}:
+        fail("路径不能为空")
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in {"", "."}:
             continue
-        if raw_segment == "..":
-            raise_api_error("Path cannot contain ..")
-        normalized_segments.append(normalize_path_segment(raw_segment))
-    if not normalized_segments and not allow_empty:
-        raise_api_error("Path cannot be empty")
-    return "/".join(normalized_segments)
+        if part == "..":
+            fail("路径不能包含 ..")
+        parts.append(sanitize_segment(part))
+    if not parts and not allow_empty:
+        fail("路径不能为空")
+    return "/".join(parts)
 
 
-def resolve_storage_path(relative_path: str | None, *, allow_empty: bool = True) -> Path:
-    normalized_relative_path = normalize_relative_path(relative_path, allow_empty=allow_empty)
-    resolved_path = (STORAGE_ROOT / normalized_relative_path).resolve()
+def resolve_in_root(rel: str | None, *, allow_empty: bool = True) -> Path:
+    rel_clean = clean_rel_path(rel, allow_empty=allow_empty)
+    target = (ROOT_DIR / rel_clean).resolve()
     try:
-        resolved_path.relative_to(STORAGE_ROOT)
+        target.relative_to(ROOT_DIR)
     except ValueError:
-        raise_api_error("Path escapes the storage root")
-    return resolved_path
+        fail("路径越界")
+    return target
 
 
-def get_relative_path(absolute_path: Path) -> str:
-    resolved_path = absolute_path.resolve()
-    if resolved_path == STORAGE_ROOT:
+def rel_from_path(path: Path) -> str:
+    if path.resolve() == ROOT_DIR:
         return ""
-    return resolved_path.relative_to(STORAGE_ROOT).as_posix()
+    return path.resolve().relative_to(ROOT_DIR).as_posix()
 
 
-def build_item_metadata(item_path: Path) -> dict:
-    item_status = item_path.stat()
-    item_is_directory = item_path.is_dir()
+def item_info(path: Path) -> dict:
+    st = path.stat()
+    is_dir = path.is_dir()
     return {
-        "name": item_path.name,
-        "path": get_relative_path(item_path),
-        "type": "dir" if item_is_directory else "file",
-        "size": None if item_is_directory else item_status.st_size,
-        "mtime": int(item_status.st_mtime),
+        "name": path.name,
+        "path": rel_from_path(path),
+        "type": "dir" if is_dir else "file",
+        "size": None if is_dir else st.st_size,
+        "mtime": int(st.st_mtime),
     }
 
 
-def list_directory_contents(relative_path: str) -> dict:
-    directory_path = resolve_storage_path(relative_path)
-    if not directory_path.exists():
-        raise_api_error("Directory does not exist", 404)
-    if not directory_path.is_dir():
-        raise_api_error("Path is not a directory")
-    directory_items = [build_item_metadata(child_path) for child_path in directory_path.iterdir()]
-    directory_items.sort(key=lambda item: (item["type"] != "dir", item["name"].lower()))
-    clean_relative_path = get_relative_path(directory_path)
-    breadcrumbs = [{"name": "Root", "path": ""}]
-    breadcrumb_segments: list[str] = []
-    for path_segment in clean_relative_path.split("/") if clean_relative_path else []:
-        breadcrumb_segments.append(path_segment)
-        breadcrumbs.append({"name": path_segment, "path": "/".join(breadcrumb_segments)})
-    return {
-        "ok": True,
-        "path": clean_relative_path,
-        "breadcrumbs": breadcrumbs,
-        "items": directory_items,
-    }
+def list_dir(rel: str) -> dict:
+    folder = resolve_in_root(rel)
+    if not folder.exists():
+        fail("目录不存在", 404)
+    if not folder.is_dir():
+        fail("不是目录")
+    entries = [item_info(p) for p in folder.iterdir()]
+    entries.sort(key=lambda x: (x["type"] != "dir", x["name"].lower()))
+
+    rel_clean = rel_from_path(folder)
+    crumbs = [{"name": "根目录", "path": ""}]
+    acc: list[str] = []
+    for part in rel_clean.split("/") if rel_clean else []:
+        acc.append(part)
+        crumbs.append({"name": part, "path": "/".join(acc)})
+    return {"ok": True, "path": rel_clean, "breadcrumbs": crumbs, "items": entries}
 
 
-# Hashing is used for upload verification and collision handling.
-# Uploads provide a client-side SHA-256 value; the server recomputes SHA-256 after saving.
-# Existing files are replaced only when the content hash matches the incoming file.
-def calculate_file_sha256(file_path: Path) -> str:
-    hash_context = hashlib.sha256()
-    with file_path.open("rb") as file_stream:
-        for file_chunk in iter(lambda: file_stream.read(1024 * 1024), b""):
-            hash_context.update(file_chunk)
-    return hash_context.hexdigest()
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def calculate_directory_sha256(directory_path: Path) -> str:
-    hash_context = hashlib.sha256()
-    directory_root = directory_path.resolve()
-    sorted_paths = sorted(directory_root.rglob("*"), key=lambda child_path: child_path.relative_to(directory_root).as_posix())
-    for child_path in sorted_paths:
-        child_relative_bytes = child_path.relative_to(directory_root).as_posix().encode("utf-8", "surrogateescape")
-        if child_path.is_dir():
-            hash_context.update(b"D\0" + child_relative_bytes + b"\0")
-            continue
-        if child_path.is_file():
-            hash_context.update(b"F\0" + child_relative_bytes + b"\0")
-            hash_context.update(calculate_file_sha256(child_path).encode("ascii"))
-            hash_context.update(b"\0")
-
-    return hash_context.hexdigest()
+def sha256_tree(path: Path) -> str:
+    """给目录做稳定摘要：相对路径 + 文件内容哈希都参与。"""
+    h = hashlib.sha256()
+    base = path.resolve()
+    for p in sorted(base.rglob("*"), key=lambda x: x.relative_to(base).as_posix()):
+        rel = p.relative_to(base).as_posix().encode("utf-8", "surrogateescape")
+        if p.is_dir():
+            h.update(b"D\0" + rel + b"\0")
+        elif p.is_file():
+            h.update(b"F\0" + rel + b"\0")
+            h.update(sha256_file(p).encode("ascii"))
+            h.update(b"\0")
+    return h.hexdigest()
 
 
-def paths_have_same_content(first_path: Path, second_path: Path) -> bool:
-    if not first_path.exists() or not second_path.exists():
+def same_payload(a: Path, b: Path) -> bool:
+    if not a.exists() or not b.exists():
         return False
-    if first_path.is_file() and second_path.is_file():
-        return calculate_file_sha256(first_path) == calculate_file_sha256(second_path)
-    if first_path.is_dir() and second_path.is_dir():
-        return calculate_directory_sha256(first_path) == calculate_directory_sha256(second_path)
+    if a.is_file() and b.is_file():
+        return sha256_file(a) == sha256_file(b)
+    if a.is_dir() and b.is_dir():
+        return sha256_tree(a) == sha256_tree(b)
     return False
 
 
-def build_timestamped_path(target_path: Path) -> Path:
-    timestamp_suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
-    target_parent = target_path.parent
-
-    if target_path.suffix:
-        timestamped_path = target_parent / f"{target_path.stem}_{timestamp_suffix}{target_path.suffix}"
+def timestamped_path(path: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    parent = path.parent
+    if path.suffix:
+        stem, suffix = path.stem, path.suffix
+        candidate = parent / f"{stem}_{ts}{suffix}"
     else:
-        timestamped_path = target_parent / f"{target_path.name}_{timestamp_suffix}"
-
-    conflict_counter = 2
-    while timestamped_path.exists():
-        if target_path.suffix:
-            timestamped_path = target_parent / f"{target_path.stem}_{timestamp_suffix}_{conflict_counter}{target_path.suffix}"
+        candidate = parent / f"{path.name}_{ts}"
+    n = 2
+    while candidate.exists():
+        if path.suffix:
+            candidate = parent / f"{path.stem}_{ts}_{n}{path.suffix}"
         else:
-            timestamped_path = target_parent / f"{target_path.name}_{timestamp_suffix}_{conflict_counter}"
-        conflict_counter += 1
+            candidate = parent / f"{path.name}_{ts}_{n}"
+        n += 1
+    return candidate
 
-    return timestamped_path
 
-
-def remove_path(target_path: Path) -> None:
-    if not target_path.exists():
+def remove_any(path: Path) -> None:
+    if not path.exists():
         return
-    if target_path.is_dir():
-        shutil.rmtree(target_path)
-        return
-    target_path.unlink()
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
 
 
-def move_or_replace_with_collision_handling(source_path: Path, target_path: Path) -> tuple[Path, str]:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    final_path = target_path
-    operation_result = "moved"
-    if target_path.exists() and paths_have_same_content(source_path, target_path):
-        remove_path(target_path)
-        operation_result = "replaced_same_hash"
-    elif target_path.exists():
-        final_path = build_timestamped_path(target_path)
-        operation_result = "renamed_with_timestamp"
+def place_with_collision(src: Path, dest: Path) -> tuple[Path, str]:
+    """移动 src 到 dest。dest 已存在时：同哈希替换，不同哈希加时间戳。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    action = "moved"
+    final = dest
+    if dest.exists():
+        if same_payload(src, dest):
+            remove_any(dest)
+            action = "replaced_same_hash"
+        else:
+            final = timestamped_path(dest)
+            action = "renamed_with_timestamp"
+    shutil.move(str(src), str(final))
+    return final, action
 
-    shutil.move(str(source_path), str(final_path))
-    return final_path, operation_result
 
-
-def path_is_inside_or_equal(parent_path: Path, child_path: Path) -> bool:
+def is_child_or_same(parent: Path, child: Path) -> bool:
     try:
-        child_path.resolve().relative_to(parent_path.resolve())
+        child.resolve().relative_to(parent.resolve())
         return True
     except ValueError:
         return False
 
 
-# Archive files are written to disk first and served later by URL.
-# The server creates .7z files in ARCHIVE_BUFFER_ROOT and then returns a download URL.
-# Old archive job directories are removed by age to keep the buffer directory bounded.
-def remove_expired_archives() -> None:
-    current_timestamp = time.time()
-    ARCHIVE_BUFFER_ROOT.mkdir(parents=True, exist_ok=True)
-    for archive_job_directory in ARCHIVE_BUFFER_ROOT.iterdir():
+def cleanup_old_archives() -> None:
+    now = time.time()
+    ARCHIVE_BUFFER_DIR.mkdir(parents=True, exist_ok=True)
+    for p in ARCHIVE_BUFFER_DIR.iterdir():
         try:
-            archive_age_seconds = current_timestamp - archive_job_directory.stat().st_mtime
+            if now - p.stat().st_mtime > ARCHIVE_MAX_AGE_SECONDS:
+                remove_any(p)
         except FileNotFoundError:
-            continue
-        if archive_age_seconds > ARCHIVE_MAX_AGE_SECONDS:
-            remove_path(archive_job_directory)
+            pass
 
 
-def unique_existing_item_paths(raw_item_paths: Iterable[str]) -> list[str]:
-    unique_paths: list[str] = []
-    seen_paths: set[str] = set()
+def make_7z_archive(items: Iterable[str]) -> Path:
+    """
+    用 py7zr 在磁盘缓冲目录中生成 .7z，再由 Flask 发送文件。
+    注意：这里不会把最终压缩包构造在内存中；archive_path 是真实落盘文件。
+    """
+    rels: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        rel = clean_rel_path(raw, allow_empty=False)
+        p = resolve_in_root(rel, allow_empty=False)
+        if not p.exists():
+            fail(f"不存在：{rel}", 404)
+        if rel not in seen:
+            rels.append(rel)
+            seen.add(rel)
+    if not rels:
+        fail("没有选择任何文件")
 
-    for raw_item_path in raw_item_paths:
-        relative_path = normalize_relative_path(raw_item_path, allow_empty=False)
-        storage_path = resolve_storage_path(relative_path, allow_empty=False)
-        if not storage_path.exists():
-            raise_api_error(f"Item does not exist: {relative_path}", 404)
-        if relative_path in seen_paths:
-            continue
-        unique_paths.append(relative_path)
-        seen_paths.add(relative_path)
+    cleanup_old_archives()
+    job_dir = ARCHIVE_BUFFER_DIR / uuid.uuid4().hex
+    job_dir.mkdir(parents=True, exist_ok=False)
+    archive_name = f"download_{datetime.now().strftime('%Y%m%d-%H%M%S')}.7z"
+    archive_path = job_dir / archive_name
 
-    if not unique_paths:
-        raise_api_error("No files or directories were selected")
-    return unique_paths
-
-
-def build_py7zr_filters() -> list[dict]:
-    preset_value = PY7ZR_PRESET_LEVEL
-    if PY7ZR_EXTREME_MODE:
-        preset_value = preset_value | lzma.PRESET_EXTREME
-    return [{"id": py7zr.FILTER_LZMA2, "preset": preset_value}]
-
-
-def create_7z_archive(item_paths: Iterable[str]) -> tuple[str, Path]:
-    archive_item_paths = unique_existing_item_paths(item_paths)
-    remove_expired_archives()
-
-    archive_job_id = uuid.uuid4().hex
-    archive_job_directory = ARCHIVE_BUFFER_ROOT / archive_job_id
-    archive_job_directory.mkdir(parents=True, exist_ok=False)
-
-    archive_file_name = f"download_{datetime.now().strftime('%Y%m%d-%H%M%S')}.7z"
-    archive_path = archive_job_directory / archive_file_name
+    preset = max(0, min(9, PY7ZR_PRESET))
+    filters = [{"id": py7zr.FILTER_LZMA2, "preset": preset}]
 
     try:
-        with py7zr.SevenZipFile(archive_path, mode="w", filters=build_py7zr_filters()) as archive_file:
-            for relative_path in archive_item_paths:
-                storage_path = resolve_storage_path(relative_path, allow_empty=False)
-                if storage_path.is_dir():
-                    archive_file.writeall(storage_path, arcname=relative_path)
-                    continue
-                archive_file.write(storage_path, arcname=relative_path)
-    except Exception as error:
-        remove_path(archive_job_directory)
-        raise_api_error(f"py7zr archive creation failed: {error}", 500)
+        with py7zr.SevenZipFile(archive_path, mode="w", filters=filters) as archive:
+            for rel in rels:
+                src = resolve_in_root(rel, allow_empty=False)
+                # arcname 使用相对 ROOT_DIR 的路径，避免把服务器绝对路径写入压缩包。
+                if src.is_dir():
+                    archive.writeall(src, arcname=rel)
+                else:
+                    archive.write(src, arcname=rel)
+    except Exception as exc:
+        remove_any(job_dir)
+        fail(f"py7zr 压缩失败：{exc}", 500)
 
     if not archive_path.exists() or archive_path.stat().st_size <= 0:
-        remove_path(archive_job_directory)
-        raise_api_error("py7zr archive creation failed: no valid archive was created", 500)
-
-    return archive_job_id, archive_path
-
-
-def resolve_archive_download_path(archive_job_id: str, archive_file_name: str) -> Path:
-    if not ARCHIVE_JOB_PATTERN.match(archive_job_id):
-        raise_api_error("Invalid archive job", 404)
-
-    safe_archive_file_name = normalize_path_segment(archive_file_name)
-    archive_path = (ARCHIVE_BUFFER_ROOT / archive_job_id / safe_archive_file_name).resolve()
-    try:
-        archive_path.relative_to(ARCHIVE_BUFFER_ROOT)
-    except ValueError:
-        raise_api_error("Path escapes the archive buffer root", 404)
-
-    if not archive_path.exists() or not archive_path.is_file():
-        raise_api_error("Archive does not exist or has expired", 404)
+        remove_any(job_dir)
+        fail("py7zr 压缩失败：没有生成有效压缩包", 500)
     return archive_path
 
-
-# Flask routes.
-# The backend exposes a small JSON API used by the single-page frontend below.
-# The HTML, CSS, and JavaScript are kept in this file to make the teaching example easy to read.
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML)
 
 
 @app.get("/api/list")
 def api_list():
-    return jsonify(list_directory_contents(request.args.get("path", "")))
+    return jsonify(list_dir(request.args.get("path", "")))
 
 
 @app.post("/api/mkdir")
 def api_mkdir():
-    request_data = request.get_json(force=True)
-    parent_directory = resolve_storage_path(request_data.get("path", ""))
-    if not parent_directory.is_dir():
-        raise_api_error("Target is not a directory")
-
-    directory_name = normalize_path_segment(str(request_data.get("name", "")).strip())
-    with STORAGE_WRITE_LOCK:
-        new_directory_path = parent_directory / directory_name
-        if new_directory_path.exists():
-            new_directory_path = build_timestamped_path(new_directory_path)
-        new_directory_path.mkdir(parents=True, exist_ok=False)
-
-    return jsonify({"ok": True, "item": build_item_metadata(new_directory_path)})
+    data = request.get_json(force=True)
+    base = resolve_in_root(data.get("path", ""))
+    if not base.is_dir():
+        fail("目标不是目录")
+    name = sanitize_segment(str(data.get("name", "")).strip())
+    final = base / name
+    if final.exists():
+        final = timestamped_path(final)
+    final.mkdir(parents=True, exist_ok=False)
+    return jsonify({"ok": True, "item": item_info(final)})
 
 
 @app.post("/api/upload")
 def api_upload():
-    # Upload safety flow:
-    # 1. Save the incoming file to a temporary buffer path.
-    # 2. Recalculate SHA-256 from the bytes that were actually written to disk.
-    # 3. Reject the upload if the server hash differs from the browser hash.
-    # 4. Move the verified temporary file into STORAGE_ROOT under a write lock.
-    target_directory = resolve_storage_path(request.args.get("path", ""))
-    if not target_directory.exists() or not target_directory.is_dir():
-        raise_api_error("Upload target is not a directory")
+    target_dir = resolve_in_root(request.args.get("path", ""))
+    if not target_dir.exists() or not target_dir.is_dir():
+        fail("上传目标不是目录")
 
-    uploaded_file = request.files.get("file")
-    if uploaded_file is None:
-        raise_api_error("No file was received")
+    uploaded = request.files.getlist("files")
+    if not uploaded:
+        fail("没有收到文件")
 
-    expected_file_hash = str(request.form.get("sha256", "")).lower().strip()
-    if not SHA256_PATTERN.match(expected_file_hash):
-        raise_api_error("Missing or invalid sha256 value")
+    results = []
+    for storage in uploaded:
+        rel_name = clean_rel_path(storage.filename, allow_empty=False)
+        dest = target_dir / rel_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
-    relative_file_path = normalize_relative_path(
-        request.form.get("relativePath") or uploaded_file.filename,
-        allow_empty=False,
-    )
-    target_path = target_directory / relative_file_path
-    temporary_upload_path = UPLOAD_BUFFER_ROOT / f"upload_{uuid.uuid4().hex}.tmp"
+        tmp = UPLOAD_BUFFER_DIR / f"upload_{uuid.uuid4().hex}.tmp"
+        storage.save(tmp)
+        final, action = place_with_collision(tmp, dest)
+        results.append({"path": rel_from_path(final), "action": action})
 
-    try:
-        uploaded_file.save(temporary_upload_path)
-        actual_file_hash = calculate_file_sha256(temporary_upload_path)
-
-        if actual_file_hash != expected_file_hash:
-            remove_path(temporary_upload_path)
-            return jsonify({
-                "ok": False,
-                "code": "hash_mismatch",
-                "error": "hash is not match",
-                "expectedSha256": expected_file_hash,
-                "actualSha256": actual_file_hash,
-                "relativePath": relative_file_path,
-            }), 409
-
-        with STORAGE_WRITE_LOCK:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            final_path, operation_result = move_or_replace_with_collision_handling(temporary_upload_path, target_path)
-    except ApiError:
-        remove_path(temporary_upload_path)
-        raise
-    except Exception as error:
-        remove_path(temporary_upload_path)
-        raise_api_error(f"Upload failed: {error}", 500)
-
-    return jsonify({
-        "ok": True,
-        "item": build_item_metadata(final_path),
-        "action": operation_result,
-        "expectedSha256": expected_file_hash,
-    })
+    return jsonify({"ok": True, "uploaded": results})
 
 
 @app.post("/api/delete")
 def api_delete():
-    request_data = request.get_json(force=True)
-    selected_items = request_data.get("items") or []
-    if not isinstance(selected_items, list):
-        raise_api_error("items must be a list")
-
-    deleted_paths = []
-    with STORAGE_WRITE_LOCK:
-        for raw_item_path in selected_items:
-            relative_path = normalize_relative_path(raw_item_path, allow_empty=False)
-            storage_path = resolve_storage_path(relative_path, allow_empty=False)
-            if not storage_path.exists():
-                continue
-            remove_path(storage_path)
-            deleted_paths.append(relative_path)
-
-    return jsonify({"ok": True, "deleted": deleted_paths})
+    data = request.get_json(force=True)
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        fail("items 必须是列表")
+    deleted = []
+    for raw in items:
+        rel = clean_rel_path(raw, allow_empty=False)
+        p = resolve_in_root(rel, allow_empty=False)
+        if not p.exists():
+            continue
+        remove_any(p)
+        deleted.append(rel)
+    return jsonify({"ok": True, "deleted": deleted})
 
 
 @app.post("/api/move")
 def api_move():
-    request_data = request.get_json(force=True)
-    selected_items = request_data.get("items") or []
-    destination_relative_path = request_data.get("dest", "")
-    if not isinstance(selected_items, list):
-        raise_api_error("items must be a list")
+    data = request.get_json(force=True)
+    items = data.get("items") or []
+    dest_rel = data.get("dest", "")
+    if not isinstance(items, list):
+        fail("items 必须是列表")
+    dest_dir = resolve_in_root(dest_rel)
+    if not dest_dir.exists() or not dest_dir.is_dir():
+        fail("移动目标不是目录")
 
-    destination_directory = resolve_storage_path(destination_relative_path)
-    if not destination_directory.exists() or not destination_directory.is_dir():
-        raise_api_error("Move destination is not a directory")
-
-    moved_items = []
-    with STORAGE_WRITE_LOCK:
-        for raw_item_path in selected_items:
-            relative_path = normalize_relative_path(raw_item_path, allow_empty=False)
-            source_path = resolve_storage_path(relative_path, allow_empty=False)
-            if not source_path.exists():
-                continue
-            if source_path.resolve() == STORAGE_ROOT:
-                raise_api_error("The storage root cannot be moved")
-            if source_path.resolve() == destination_directory.resolve():
-                continue
-            if source_path.is_dir() and path_is_inside_or_equal(source_path, destination_directory):
-                raise_api_error(f"A directory cannot be moved into itself or one of its children: {relative_path}")
-
-            target_path = destination_directory / source_path.name
-            if source_path.resolve() == target_path.resolve():
-                continue
-
-            final_path, operation_result = move_or_replace_with_collision_handling(source_path, target_path)
-            moved_items.append({"from": relative_path, "to": get_relative_path(final_path), "action": operation_result})
-
-    return jsonify({"ok": True, "moved": moved_items})
+    moved = []
+    for raw in items:
+        rel = clean_rel_path(raw, allow_empty=False)
+        src = resolve_in_root(rel, allow_empty=False)
+        if not src.exists():
+            continue
+        if src.resolve() == ROOT_DIR:
+            fail("不能移动根目录")
+        if src.resolve() == dest_dir.resolve():
+            continue
+        if src.is_dir() and is_child_or_same(src, dest_dir):
+            fail(f"不能把目录移动到自己或自己的子目录中：{rel}")
+        target = dest_dir / src.name
+        if src.resolve() == target.resolve():
+            continue
+        final, action = place_with_collision(src, target)
+        moved.append({"from": rel, "to": rel_from_path(final), "action": action})
+    return jsonify({"ok": True, "moved": moved})
 
 
 @app.post("/api/rename")
 def api_rename():
-    request_data = request.get_json(force=True)
-    relative_path = normalize_relative_path(request_data.get("path"), allow_empty=False)
-    source_path = resolve_storage_path(relative_path, allow_empty=False)
-    if not source_path.exists():
-        raise_api_error("Source path does not exist", 404)
-    if source_path.resolve() == STORAGE_ROOT:
-        raise_api_error("The storage root cannot be renamed")
-
-    new_name = normalize_path_segment(str(request_data.get("name", "")).strip())
-    target_path = source_path.parent / new_name
-    if target_path.resolve() == source_path.resolve():
-        return jsonify({"ok": True, "item": build_item_metadata(source_path), "action": "noop"})
-
-    with STORAGE_WRITE_LOCK:
-        final_path, operation_result = move_or_replace_with_collision_handling(source_path, target_path)
-    return jsonify({"ok": True, "item": build_item_metadata(final_path), "action": operation_result})
+    data = request.get_json(force=True)
+    rel = clean_rel_path(data.get("path"), allow_empty=False)
+    src = resolve_in_root(rel, allow_empty=False)
+    if not src.exists():
+        fail("源路径不存在", 404)
+    if src.resolve() == ROOT_DIR:
+        fail("不能重命名根目录")
+    new_name = sanitize_segment(str(data.get("name", "")).strip())
+    target = src.parent / new_name
+    if target.resolve() == src.resolve():
+        return jsonify({"ok": True, "item": item_info(src), "action": "noop"})
+    final, action = place_with_collision(src, target)
+    return jsonify({"ok": True, "item": item_info(final), "action": action})
 
 
 @app.get("/api/download")
-def api_download_single_item():
-    relative_path = normalize_relative_path(request.args.get("path"), allow_empty=False)
-    storage_path = resolve_storage_path(relative_path, allow_empty=False)
-    if not storage_path.exists():
-        raise_api_error("File does not exist", 404)
-
-    if storage_path.is_dir():
-        archive_job_id, archive_path = create_7z_archive([relative_path])
-        return send_file(archive_path, as_attachment=True, download_name=archive_path.name)
-
-    return send_from_directory(STORAGE_ROOT, relative_path, as_attachment=True, download_name=storage_path.name)
-
-
-@app.post("/api/archive")
-def api_create_archive():
-    request_data = request.get_json(force=True)
-    selected_items = request_data.get("items") or []
-    if not isinstance(selected_items, list):
-        raise_api_error("items must be a list")
-
-    archive_job_id, archive_path = create_7z_archive(selected_items)
-    download_url = f"/api/archive/{archive_job_id}/{archive_path.name}"
-    return jsonify({"ok": True, "downloadUrl": download_url})
+def api_download_one():
+    rel = clean_rel_path(request.args.get("path"), allow_empty=False)
+    p = resolve_in_root(rel, allow_empty=False)
+    if not p.exists():
+        fail("文件不存在", 404)
+    if p.is_dir():
+        archive = make_7z_archive([rel])
+        return send_file(archive, as_attachment=True, download_name=archive.name)
+    # send_from_directory 会把 path 限定在 ROOT_DIR 下；rel 已经过本地二次校验。
+    return send_from_directory(ROOT_DIR, rel, as_attachment=True, download_name=p.name)
 
 
-@app.get("/api/archive/<archive_job_id>/<archive_file_name>")
-def api_download_archive(archive_job_id: str, archive_file_name: str):
-    archive_path = resolve_archive_download_path(archive_job_id, archive_file_name)
-    return send_file(archive_path, as_attachment=True, download_name=archive_path.name)
+@app.post("/api/download")
+def api_download_many():
+    data = request.get_json(force=True)
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        fail("items 必须是列表")
+    if len(items) == 1:
+        rel = clean_rel_path(items[0], allow_empty=False)
+        p = resolve_in_root(rel, allow_empty=False)
+        if p.is_file():
+            return send_from_directory(ROOT_DIR, rel, as_attachment=True, download_name=p.name)
+    archive = make_7z_archive(items)
+    return send_file(archive, as_attachment=True, download_name=archive.name)
 
 
-HTML_TEMPLATE = r'''
+HTML = r'''
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Flask File Manager</title>
+  <title>Flask 文件管理器</title>
   <style>
     :root {
-      --background: rgb(20, 5, 0);
-      --surface: #fff4d2;
-      --surface-strong: #ffe3a1;
-      --line: #d8a84e;
-      --text: #2a0a00;
-      --muted: #8b5b22;
-      --hover: #ffe7ad;
-      --selected: #ffd78a;
-      --selected-border: #a94414;
-      --danger: #9f1d16;
-      --menu-shadow: 0 12px 40px rgba(20, 5, 0, .32);
+      --bg: #f6f7f8;
+      --panel: #ffffff;
+      --line: #e6e8eb;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --hover: #f1f5f9;
+      --selected: #dbeafe;
+      --selected-line: #93c5fd;
+      --menu-shadow: 0 12px 40px rgba(0,0,0,.18);
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
     body {
       margin: 0;
       font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--text);
-      background: var(--background);
+      background: var(--bg);
       user-select: none;
     }
-    #app {
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    .breadcrumb-bar {
-      height: 38px;
-      flex: 0 0 auto;
+    #app { min-height: 100vh; display: flex; flex-direction: column; }
+    .crumbbar {
+      height: 42px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
       display: flex;
       align-items: center;
       gap: 4px;
-      padding: 0 10px;
-      overflow-x: auto;
+      padding: 0 12px;
+      overflow: auto;
       white-space: nowrap;
-      background: var(--surface);
-      border-bottom: 1px solid var(--line);
     }
-    .breadcrumb-item {
+    .crumb {
       display: inline-flex;
       align-items: center;
-      height: 24px;
+      height: 26px;
       padding: 0 8px;
-      border-radius: 5px;
-      color: #a94414;
+      border-radius: 6px;
+      color: #2563eb;
       cursor: pointer;
     }
-    .breadcrumb-item:hover,
-    .breadcrumb-item.drop-target {
-      background: #ffe7ad;
-    }
-    .breadcrumb-separator {
-      color: var(--muted);
-    }
-    .workspace {
+    .crumb:hover, .crumb.drop-target { background: #eff6ff; }
+    .slash { color: var(--muted); }
+    .main {
       flex: 1;
-      min-height: 0;
       position: relative;
       overflow: auto;
-      background: var(--surface);
+      padding: 12px;
     }
-    .file-table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
+    .file-list {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      min-height: calc(100vh - 68px);
+      overflow: hidden;
     }
-    .file-table thead {
-      position: sticky;
-      top: 0;
-      z-index: 5;
-      background: var(--surface-strong);
+    .header, .row {
+      display: grid;
+      grid-template-columns: 36px minmax(220px, 1fr) 120px 180px;
+      align-items: center;
+      gap: 8px;
+      min-height: 42px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .header {
+      min-height: 34px;
       color: var(--muted);
       font-size: 12px;
+      background: #fafafa;
     }
-    .file-table th,
-    .file-table td {
-      height: 38px;
-      padding: 0 10px;
-      border-bottom: 1px solid var(--line);
-      text-align: left;
-      vertical-align: middle;
-    }
-    .file-table th:first-child,
-    .file-table td:first-child {
-      width: 42px;
-      text-align: center;
-    }
-    .file-table th:nth-child(3),
-    .file-table td:nth-child(3) {
-      width: 120px;
-    }
-    .file-table th:nth-child(4),
-    .file-table td:nth-child(4) {
-      width: 180px;
-    }
-    .file-row {
-      cursor: default;
-    }
-    .file-row:hover {
-      background: var(--hover);
-    }
-    .file-row.selected {
+    .row { cursor: default; }
+    .row:hover { background: var(--hover); }
+    .row.selected {
       background: var(--selected);
-      box-shadow: inset 3px 0 0 var(--selected-border);
+      box-shadow: inset 3px 0 0 var(--selected-line);
     }
-    .file-row.drop-target {
-      outline: 2px solid var(--selected-border);
-      outline-offset: -2px;
-    }
-    .file-icon {
-      font-size: 19px;
-    }
-    .file-name {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .muted-text {
-      color: var(--muted);
-    }
-    .empty-state {
-      padding: 56px 16px;
+    .row.drop-target { outline: 2px solid #60a5fa; outline-offset: -2px; }
+    .icon { font-size: 20px; text-align: center; }
+    .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .muted { color: var(--muted); }
+    .empty {
+      padding: 60px 16px;
       text-align: center;
       color: var(--muted);
     }
     .selection-box {
       position: fixed;
-      z-index: 30;
+      border: 1px solid #2563eb;
+      background: rgba(37, 99, 235, .12);
       pointer-events: none;
-      border: 1px solid var(--selected-border);
-      background: rgba(255, 215, 138, .38);
+      z-index: 30;
     }
-    .context-menu {
+    .menu {
       position: fixed;
       z-index: 100;
-      min-width: 176px;
-      display: none;
+      min-width: 170px;
       padding: 6px;
       border: 1px solid var(--line);
-      border-radius: 9px;
-      background: var(--surface);
+      border-radius: 10px;
+      background: var(--panel);
       box-shadow: var(--menu-shadow);
+      display: none;
     }
-    .context-menu.show {
-      display: block;
-    }
-    .menu-item {
-      display: block;
+    .menu.show { display: block; }
+    .menu button {
       width: 100%;
-      padding: 8px 10px;
-      border-radius: 7px;
-      cursor: pointer;
+      display: block;
+      border: 0;
+      background: transparent;
       color: var(--text);
+      text-align: left;
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font: inherit;
     }
-    .menu-item:hover {
-      background: var(--hover);
-    }
-    .menu-item.danger {
-      color: var(--danger);
-    }
-    .menu-separator {
-      height: 1px;
-      margin: 5px 4px;
-      background: var(--line);
-    }
+    .menu button:hover { background: var(--hover); }
+    .menu button.danger { color: #dc2626; }
+    .menu .sep { height: 1px; background: var(--line); margin: 5px 4px; }
     .toast {
       position: fixed;
       left: 50%;
       bottom: 22px;
-      z-index: 120;
-      display: none;
-      max-width: min(720px, calc(100vw - 30px));
+      transform: translateX(-50%);
+      background: rgba(17,24,39,.92);
+      color: white;
       padding: 9px 12px;
       border-radius: 999px;
-      overflow: hidden;
-      white-space: nowrap;
-      text-overflow: ellipsis;
-      transform: translateX(-50%);
-      background: rgba(74, 16, 0, .96);
-      color: #fff4d2;
-    }
-    .toast.show {
-      display: block;
-    }
-    .upload-panel {
-      position: fixed;
-      right: 14px;
-      bottom: 14px;
-      z-index: 110;
       display: none;
-      width: min(460px, calc(100vw - 28px));
-      max-height: min(360px, calc(100vh - 80px));
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: var(--surface);
-      box-shadow: var(--menu-shadow);
-    }
-    .upload-panel.show {
-      display: block;
-    }
-    .upload-header {
-      position: sticky;
-      top: 0;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding: 9px 10px;
-      border-bottom: 1px solid var(--line);
-      background: var(--surface);
-      font-size: 13px;
-      font-weight: 600;
-    }
-    .upload-task-list {
-      padding: 6px 8px 8px;
-    }
-    .upload-task {
-      padding: 7px 4px;
-      border-bottom: 1px solid var(--line);
-    }
-    .upload-task:last-child {
-      border-bottom: 0;
-    }
-    .upload-task-name {
+      z-index: 120;
+      max-width: min(720px, calc(100vw - 30px));
+      white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 12px;
     }
-    .upload-task-meta {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      margin-top: 3px;
-      color: var(--muted);
-      font-size: 11px;
-    }
-    .upload-progress-track {
-      height: 4px;
-      margin-top: 5px;
-      overflow: hidden;
-      border-radius: 999px;
-      background: #e9c879;
-    }
-    .upload-progress-bar {
-      height: 100%;
-      width: 0;
-      border-radius: inherit;
-      background: #a94414;
-    }
-    input[type=file] {
-      display: none;
-    }
+    .toast.show { display: block; }
+    input[type=file] { display: none; }
   </style>
 </head>
 <body>
 <div id="app">
-  <nav id="breadcrumbBar" class="breadcrumb-bar"></nav>
-  <main id="workspace" class="workspace">
-    <table id="fileTable" class="file-table">
-      <thead>
-        <tr>
-          <th></th>
-          <th>Name</th>
-          <th>Size</th>
-          <th>Modified</th>
-        </tr>
-      </thead>
-      <tbody id="fileTableBody"></tbody>
-    </table>
-  </main>
+  <div id="crumbbar" class="crumbbar"></div>
+  <div id="main" class="main">
+    <div id="fileList" class="file-list"></div>
+  </div>
 </div>
 
-<div id="contextMenu" class="context-menu"></div>
-<div id="uploadPanel" class="upload-panel">
-  <div class="upload-header">
-    <span id="uploadPanelTitle">Upload Queue</span>
-    <span id="uploadPanelSummary" class="muted-text"></span>
-  </div>
-  <div id="uploadTaskList" class="upload-task-list"></div>
-</div>
+<div id="menu" class="menu"></div>
 <div id="toast" class="toast"></div>
 <input id="fileInput" type="file" multiple />
 <input id="folderInput" type="file" webkitdirectory directory multiple />
 
-<script src="https://cdn.jsdelivr.net/npm/hash-wasm@4.12.0"></script>
 <script>
 (() => {
-  // Runtime state.
-  // currentPath is the directory currently displayed in the table.
-  // currentItems contains the latest /api/list result for currentPath.
-  // selectedPaths stores selected item paths so context-menu actions can operate on many items.
   let currentPath = "";
-  let currentItems = [];
-  const selectedPaths = new Set();
+  let items = [];
+  const selected = new Set();
+  let menuContext = { targetPath: "" };
 
-  const breadcrumbBar = document.getElementById("breadcrumbBar");
-  const workspace = document.getElementById("workspace");
-  const fileTableBody = document.getElementById("fileTableBody");
-  const contextMenu = document.getElementById("contextMenu");
-  const uploadPanel = document.getElementById("uploadPanel");
-  const uploadPanelTitle = document.getElementById("uploadPanelTitle");
-  const uploadPanelSummary = document.getElementById("uploadPanelSummary");
-  const uploadTaskList = document.getElementById("uploadTaskList");
+  const crumbbar = document.getElementById("crumbbar");
+  const fileList = document.getElementById("fileList");
+  const main = document.getElementById("main");
+  const menu = document.getElementById("menu");
   const toast = document.getElementById("toast");
   const fileInput = document.getElementById("fileInput");
   const folderInput = document.getElementById("folderInput");
 
-  // Upload configuration.
-  // HASH_CHUNK_SIZE controls browser-side SHA-256 chunking so large files are not read at once.
-  // MAX_PARALLEL_UPLOADS controls concurrent XMLHttpRequest uploads.
-  // UPLOAD_RETRY_LIMIT is set high for unstable networks and hash-mismatch recovery.
-  const HASH_CHUNK_SIZE = 4 * 1024 * 1024;
-  const MAX_PARALLEL_UPLOADS = 4;
-  const UPLOAD_RETRY_LIMIT = 20;
-  const RETRY_DELAY_BASE_MS = 700;
-  const RETRY_DELAY_MAX_MS = 5000;
-
-  let uploadTaskSequence = 0;
-  let activeUploadCount = 0;
-  let pendingUploadTasks = [];
-  let visibleUploadTasks = [];
-
-  // Small formatting and request helpers.
-  function encodePath(path) {
-    return encodeURIComponent(path || "");
+  function qs(path) { return encodeURIComponent(path || ""); }
+  function fmtSize(n) {
+    if (n == null) return "—";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let v = n, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(i ? 1 : 0)} ${units[i]}`;
   }
-
-  function formatFileSize(sizeInBytes) {
-    if (sizeInBytes == null) return "-";
-    const sizeUnits = ["B", "KB", "MB", "GB", "TB"];
-    let displaySize = sizeInBytes;
-    let unitIndex = 0;
-    while (displaySize >= 1024 && unitIndex < sizeUnits.length - 1) {
-      displaySize /= 1024;
-      unitIndex += 1;
-    }
-    return `${displaySize.toFixed(unitIndex ? 1 : 0)} ${sizeUnits[unitIndex]}`;
+  function fmtTime(sec) {
+    if (!sec) return "—";
+    return new Date(sec * 1000).toLocaleString();
   }
-
-  function formatModifiedTime(unixSeconds) {
-    if (!unixSeconds) return "-";
-    return new Date(unixSeconds * 1000).toLocaleString();
-  }
-
-  function escapeHtml(value) {
-    return String(value).replace(/[&<>\"]/g, matchedCharacter => ({
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      "\"": "&quot;"
-    }[matchedCharacter]));
-  }
-
-  function showToast(message) {
-    toast.textContent = message;
+  function showToast(msg) {
+    toast.textContent = msg;
     toast.classList.add("show");
-    clearTimeout(showToast.timerId);
-    showToast.timerId = setTimeout(() => toast.classList.remove("show"), 2200);
+    clearTimeout(showToast.t);
+    showToast.t = setTimeout(() => toast.classList.remove("show"), 2200);
   }
-
-  async function requestJsonOrThrow(url, options = {}) {
-    const response = await fetch(url, options);
-    if (!response.ok) {
-      let errorMessage = response.statusText;
-      try {
-        const errorPayload = await response.json();
-        errorMessage = errorPayload.error || errorMessage;
-      } catch (ignoredError) {}
-      throw new Error(errorMessage);
+  async function api(url, opts = {}) {
+    const res = await fetch(url, opts);
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error || msg; } catch (_) {}
+      throw new Error(msg);
     }
-
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      return response.json();
-    }
-    return response;
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("application/json")) return res.json();
+    return res;
   }
-
-  // Directory rendering.
-  async function loadDirectory(path = currentPath) {
+  async function load(path = currentPath) {
     try {
-      const directoryPayload = await requestJsonOrThrow(`/api/list?path=${encodePath(path)}`);
-      currentPath = directoryPayload.path || "";
-      currentItems = directoryPayload.items || [];
-      selectedPaths.clear();
-      renderBreadcrumbs(directoryPayload.breadcrumbs || []);
-      renderFileTable();
-    } catch (error) {
-      showToast(error.message);
-    }
+      const data = await api(`/api/list?path=${qs(path)}`);
+      currentPath = data.path || "";
+      items = data.items || [];
+      selected.clear();
+      renderCrumbs(data.breadcrumbs || []);
+      renderList();
+    } catch (e) { showToast(e.message); }
   }
 
-  function renderBreadcrumbs(breadcrumbs) {
-    breadcrumbBar.innerHTML = "";
-    breadcrumbs.forEach((breadcrumb, breadcrumbIndex) => {
-      if (breadcrumbIndex > 0) {
-        const separatorElement = document.createElement("span");
-        separatorElement.className = "breadcrumb-separator";
-        separatorElement.textContent = "/";
-        breadcrumbBar.appendChild(separatorElement);
+  function renderCrumbs(crumbs) {
+    crumbbar.innerHTML = "";
+    crumbs.forEach((c, i) => {
+      if (i) {
+        const sep = document.createElement("span");
+        sep.className = "slash";
+        sep.textContent = "/";
+        crumbbar.appendChild(sep);
       }
-
-      const breadcrumbElement = document.createElement("span");
-      breadcrumbElement.className = "breadcrumb-item";
-      breadcrumbElement.textContent = breadcrumb.name;
-      breadcrumbElement.dataset.path = breadcrumb.path;
-      breadcrumbElement.addEventListener("click", () => loadDirectory(breadcrumb.path));
-      breadcrumbElement.addEventListener("dragover", handleDestinationDragOver);
-      breadcrumbElement.addEventListener("dragleave", () => breadcrumbElement.classList.remove("drop-target"));
-      breadcrumbElement.addEventListener("drop", async dropEvent => {
-        breadcrumbElement.classList.remove("drop-target");
-        await handleDrop(dropEvent, breadcrumb.path);
+      const el = document.createElement("span");
+      el.className = "crumb";
+      el.textContent = c.name;
+      el.dataset.path = c.path;
+      el.addEventListener("click", () => load(c.path));
+      el.addEventListener("dragover", onDragOverDest);
+      el.addEventListener("dragleave", () => el.classList.remove("drop-target"));
+      el.addEventListener("drop", async (ev) => {
+        el.classList.remove("drop-target");
+        await handleDrop(ev, c.path);
       });
-      breadcrumbBar.appendChild(breadcrumbElement);
+      crumbbar.appendChild(el);
     });
   }
 
-  function renderFileTable() {
-    fileTableBody.innerHTML = "";
-
-    if (!currentItems.length) {
-      const emptyRow = document.createElement("tr");
-      const emptyCell = document.createElement("td");
-      emptyCell.colSpan = 4;
-      emptyCell.className = "empty-state";
-      emptyCell.textContent = "This directory is empty. Drop files here to upload, or right-click the blank area for actions.";
-      emptyRow.appendChild(emptyCell);
-      fileTableBody.appendChild(emptyRow);
+  function renderList() {
+    fileList.innerHTML = `
+      <div class="header">
+        <div></div><div>名称</div><div>大小</div><div>修改时间</div>
+      </div>`;
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "空目录。右键空白区域上传文件或新建文件夹。";
+      fileList.appendChild(empty);
       return;
     }
-
-    for (const itemRecord of currentItems) {
-      const rowElement = document.createElement("tr");
-      rowElement.className = "file-row";
-      rowElement.draggable = true;
-      rowElement.dataset.path = itemRecord.path;
-      rowElement.dataset.type = itemRecord.type;
-      rowElement.innerHTML = `
-        <td class="file-icon">${itemRecord.type === "dir" ? "DIR" : "FILE"}</td>
-        <td class="file-name" title="${escapeHtml(itemRecord.name)}">${escapeHtml(itemRecord.name)}</td>
-        <td class="muted-text">${formatFileSize(itemRecord.size)}</td>
-        <td class="muted-text">${formatModifiedTime(itemRecord.mtime)}</td>`;
-
-      rowElement.addEventListener("click", clickEvent => handleRowClick(clickEvent, itemRecord));
-      rowElement.addEventListener("contextmenu", contextEvent => handleRowContextMenu(contextEvent, itemRecord));
-      rowElement.addEventListener("dragstart", dragEvent => handleDragStart(dragEvent, itemRecord));
-
-      if (itemRecord.type === "dir") {
-        rowElement.addEventListener("dragover", handleDestinationDragOver);
-        rowElement.addEventListener("dragleave", () => rowElement.classList.remove("drop-target"));
-        rowElement.addEventListener("drop", async dropEvent => {
-          rowElement.classList.remove("drop-target");
-          await handleDrop(dropEvent, itemRecord.path);
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.draggable = true;
+      row.dataset.path = item.path;
+      row.dataset.type = item.type;
+      row.innerHTML = `
+        <div class="icon">${item.type === "dir" ? "📁" : "📄"}</div>
+        <div class="name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</div>
+        <div class="muted">${fmtSize(item.size)}</div>
+        <div class="muted">${fmtTime(item.mtime)}</div>`;
+      row.addEventListener("click", (ev) => onRowClick(ev, item));
+      row.addEventListener("contextmenu", (ev) => onRowContext(ev, item));
+      row.addEventListener("dragstart", (ev) => onDragStart(ev, item));
+      if (item.type === "dir") {
+        row.addEventListener("dragover", onDragOverDest);
+        row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
+        row.addEventListener("drop", async (ev) => {
+          row.classList.remove("drop-target");
+          await handleDrop(ev, item.path);
         });
       }
-
-      fileTableBody.appendChild(rowElement);
+      fileList.appendChild(row);
     }
-
     syncSelectionView();
   }
 
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[ch]));
+  }
   function syncSelectionView() {
-    fileTableBody.querySelectorAll(".file-row").forEach(rowElement => {
-      rowElement.classList.toggle("selected", selectedPaths.has(rowElement.dataset.path));
+    fileList.querySelectorAll(".row").forEach(row => {
+      row.classList.toggle("selected", selected.has(row.dataset.path));
     });
   }
+  function selectedPaths() { return [...selected]; }
+  function selectedItems() { return items.filter(x => selected.has(x.path)); }
 
-  function getSelectedPathList() {
-    return Array.from(selectedPaths);
-  }
-
-  function getSelectedItemList() {
-    return currentItems.filter(itemRecord => selectedPaths.has(itemRecord.path));
-  }
-
-  function handleRowClick(clickEvent, itemRecord) {
-    closeContextMenu();
-
-    if (clickEvent.ctrlKey || clickEvent.metaKey) {
-      if (selectedPaths.has(itemRecord.path)) {
-        selectedPaths.delete(itemRecord.path);
-      } else {
-        selectedPaths.add(itemRecord.path);
-      }
+  function onRowClick(ev, item) {
+    closeMenu();
+    if (ev.ctrlKey || ev.metaKey) {
+      selected.has(item.path) ? selected.delete(item.path) : selected.add(item.path);
       syncSelectionView();
       return;
     }
-
-    if (itemRecord.type === "dir") {
-      loadDirectory(itemRecord.path);
-      return;
-    }
-    downloadSingleFile(itemRecord.path);
+    if (item.type === "dir") load(item.path);
+    else downloadOne(item.path);
   }
-
-  function handleRowContextMenu(contextEvent, itemRecord) {
-    contextEvent.preventDefault();
-
-    if (!selectedPaths.has(itemRecord.path)) {
-      selectedPaths.clear();
-      selectedPaths.add(itemRecord.path);
+  function onRowContext(ev, item) {
+    ev.preventDefault();
+    if (!selected.has(item.path)) {
+      selected.clear();
+      selected.add(item.path);
       syncSelectionView();
     }
-
-    showContextMenu(contextEvent.clientX, contextEvent.clientY, buildSelectionMenuActions());
+    menuContext.targetPath = item.path;
+    showMenu(ev.clientX, ev.clientY, menuForSelection());
   }
 
-  // Context menu actions.
-  function buildSelectionMenuActions() {
-    const selectedItems = getSelectedItemList();
-    const singleItem = selectedItems.length === 1 ? selectedItems[0] : null;
-    const menuActions = [];
-
-    if (singleItem && singleItem.type === "dir") {
-      menuActions.push({ label: "Open", handler: () => loadDirectory(singleItem.path) });
+  function menuForSelection() {
+    const chosen = selectedItems();
+    const one = chosen.length === 1 ? chosen[0] : null;
+    const actions = [];
+    if (one && one.type === "dir") actions.push(["打开", () => load(one.path)]);
+    actions.push([chosen.length > 1 || (one && one.type === "dir") ? "下载为 7z" : "下载", () => downloadSelected()]);
+    if (one) actions.push(["重命名", () => renameItem(one.path)]);
+    if (one && one.type === "dir") {
+      actions.push(["上传文件到此文件夹", () => pickFiles(one.path)]);
+      actions.push(["上传文件夹到此文件夹", () => pickFolder(one.path)]);
     }
-
-    menuActions.push({
-      label: selectedItems.length > 1 || (singleItem && singleItem.type === "dir") ? "Download as 7z" : "Download",
-      handler: () => downloadSelectedItems()
-    });
-
-    if (singleItem) {
-      menuActions.push({ label: "Rename", handler: () => renameItem(singleItem.path) });
-    }
-
-    menuActions.push({ separator: true });
-    menuActions.push({
-      label: selectedItems.length > 1 ? "Delete selected items" : "Delete",
-      handler: () => deleteSelectedItems(),
-      danger: true
-    });
-
-    return menuActions;
+    actions.push(["sep"]);
+    actions.push([`删除${chosen.length > 1 ? "选中项" : ""}`, () => deleteSelected(), "danger"]);
+    return actions;
   }
-
-  function buildBlankMenuActions() {
+  function menuForBlank() {
     return [
-      { label: "Upload files", handler: () => chooseFilesForUpload(currentPath) },
-      { label: "Upload folder", handler: () => chooseFolderForUpload(currentPath) },
-      { label: "New folder", handler: () => createDirectory() },
-      { label: "Refresh", handler: () => loadDirectory(currentPath) }
+      ["上传文件", () => pickFiles(currentPath)],
+      ["上传文件夹", () => pickFolder(currentPath)],
+      ["新建文件夹", () => mkdir()],
+      ["刷新", () => load(currentPath)],
     ];
   }
-
-  function showContextMenu(clientX, clientY, menuActions) {
-    contextMenu.innerHTML = "";
-
-    for (const menuAction of menuActions) {
-      if (menuAction.separator) {
-        const separatorElement = document.createElement("div");
-        separatorElement.className = "menu-separator";
-        contextMenu.appendChild(separatorElement);
+  function showMenu(x, y, actions) {
+    menu.innerHTML = "";
+    for (const a of actions) {
+      if (a[0] === "sep") {
+        const sep = document.createElement("div");
+        sep.className = "sep";
+        menu.appendChild(sep);
         continue;
       }
-
-      const menuItemElement = document.createElement("div");
-      menuItemElement.className = menuAction.danger ? "menu-item danger" : "menu-item";
-      menuItemElement.textContent = menuAction.label;
-      menuItemElement.addEventListener("click", async () => {
-        closeContextMenu();
-        try {
-          await menuAction.handler();
-        } catch (error) {
-          showToast(error.message);
-        }
+      const b = document.createElement("button");
+      b.textContent = a[0];
+      if (a[2]) b.classList.add(a[2]);
+      b.addEventListener("click", async () => {
+        closeMenu();
+        try { await a[1](); } catch (e) { showToast(e.message); }
       });
-      contextMenu.appendChild(menuItemElement);
+      menu.appendChild(b);
     }
-
-    contextMenu.classList.add("show");
-    const menuRectangle = contextMenu.getBoundingClientRect();
-    const menuLeft = Math.min(clientX, window.innerWidth - menuRectangle.width - 8);
-    const menuTop = Math.min(clientY, window.innerHeight - menuRectangle.height - 8);
-    contextMenu.style.left = `${menuLeft}px`;
-    contextMenu.style.top = `${menuTop}px`;
+    menu.classList.add("show");
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.min(x, window.innerWidth - rect.width - 8) + "px";
+    menu.style.top = Math.min(y, window.innerHeight - rect.height - 8) + "px";
   }
+  function closeMenu() { menu.classList.remove("show"); }
 
-  function closeContextMenu() {
-    contextMenu.classList.remove("show");
-  }
-
-  workspace.addEventListener("contextmenu", contextEvent => {
-    if (contextEvent.target.closest(".file-row")) return;
-    contextEvent.preventDefault();
-    selectedPaths.clear();
+  main.addEventListener("contextmenu", (ev) => {
+    if (ev.target.closest(".row")) return;
+    ev.preventDefault();
+    selected.clear();
     syncSelectionView();
-    showContextMenu(contextEvent.clientX, contextEvent.clientY, buildBlankMenuActions());
+    showMenu(ev.clientX, ev.clientY, menuForBlank());
+  });
+  document.addEventListener("click", (ev) => {
+    if (!ev.target.closest(".menu")) closeMenu();
   });
 
-  document.addEventListener("click", clickEvent => {
-    if (!clickEvent.target.closest(".context-menu")) {
-      closeContextMenu();
-    }
-  });
-
-  // Upload and file operations.
-  // The browser computes SHA-256 before upload and sends the digest with the file.
-  // The backend writes the file to disk, recalculates SHA-256, and rejects mismatches.
-  function chooseFilesForUpload(destinationPath) {
+  function pickFiles(destPath) {
     fileInput.value = "";
-    fileInput.onchange = () => uploadFileList(fileInput.files, destinationPath, false).catch(error => showToast(error.message));
+    fileInput.onchange = () => uploadFileList(fileInput.files, destPath, false);
     fileInput.click();
   }
-
-  function chooseFolderForUpload(destinationPath) {
+  function pickFolder(destPath) {
     folderInput.value = "";
-    folderInput.onchange = () => uploadFileList(folderInput.files, destinationPath, true).catch(error => showToast(error.message));
+    folderInput.onchange = () => uploadFileList(folderInput.files, destPath, true);
     folderInput.click();
   }
-
-  async function uploadFileList(fileList, destinationPath, keepRelativePath) {
-    const uploadFiles = Array.from(fileList);
-    if (!uploadFiles.length) return;
-
-    if (!window.hashwasm || !window.hashwasm.createSHA256) {
-      throw new Error("The browser hash library did not load successfully");
+  async function uploadFileList(fileListObj, destPath, keepRelative) {
+    const files = [...fileListObj];
+    if (!files.length) return;
+    const fd = new FormData();
+    for (const f of files) {
+      const rel = keepRelative && f.webkitRelativePath ? f.webkitRelativePath : f.name;
+      fd.append("files", f, rel);
     }
-
-    visibleUploadTasks = uploadFiles.map(uploadFile => {
-      uploadTaskSequence += 1;
-      return {
-        id: uploadTaskSequence,
-        file: uploadFile,
-        relativePath: keepRelativePath && uploadFile.webkitRelativePath ? uploadFile.webkitRelativePath : uploadFile.name,
-        expectedSha256: "",
-        uploadedItemPath: "",
-        status: "pending",
-        attemptCount: 0,
-        hashProgress: 0,
-        uploadProgress: 0,
-        errorMessage: "",
-      };
-    });
-    pendingUploadTasks = [...visibleUploadTasks];
-    activeUploadCount = 0;
-
-    renderUploadPanel();
-    showToast(`Preparing to upload ${visibleUploadTasks.length} file(s)...`);
-    await runUploadQueue(destinationPath);
-
-    const failedTasks = visibleUploadTasks.filter(uploadTask => uploadTask.status === "failed");
-    await loadDirectory(currentPath);
-    if (failedTasks.length) {
-      showToast(`${failedTasks.length} file(s) failed to upload`);
-      return;
-    }
-    showToast("Upload complete. Every saved file passed SHA-256 verification.");
+    showToast("正在上传...");
+    await api(`/api/upload?path=${qs(destPath)}`, { method: "POST", body: fd });
+    await load(currentPath);
+    showToast("上传完成");
   }
 
-  async function runUploadQueue(destinationPath) {
-    // This queue behaves like a small thread pool in the browser.
-    // It starts up to MAX_PARALLEL_UPLOADS asynchronous upload tasks at the same time.
-    return new Promise(resolveUploadQueue => {
-      function launchMoreUploadTasks() {
-        while (activeUploadCount < MAX_PARALLEL_UPLOADS && pendingUploadTasks.length) {
-          const uploadTask = pendingUploadTasks.shift();
-          activeUploadCount += 1;
-          runUploadTask(uploadTask, destinationPath)
-            .catch(error => {
-              uploadTask.status = "failed";
-              uploadTask.errorMessage = error.message;
-              renderUploadPanel();
-            })
-            .finally(() => {
-              activeUploadCount -= 1;
-              if (!pendingUploadTasks.length && activeUploadCount === 0) {
-                renderUploadPanel();
-                resolveUploadQueue();
-                return;
-              }
-              launchMoreUploadTasks();
-            });
-        }
-      }
-
-      launchMoreUploadTasks();
-    });
-  }
-
-  async function runUploadTask(uploadTask, destinationPath) {
-    // A task has two phases: local hashing and network upload.
-    // Retryable failures include network errors, server errors, and server-side hash mismatches.
-    uploadTask.status = "hashing";
-    uploadTask.errorMessage = "";
-    renderUploadPanel();
-
-    uploadTask.expectedSha256 = await calculateFileSha256(uploadTask.file, hashProgress => {
-      uploadTask.hashProgress = hashProgress;
-      renderUploadPanel();
-    });
-
-    while (true) {
-      uploadTask.attemptCount += 1;
-      uploadTask.status = "uploading";
-      uploadTask.uploadProgress = 0;
-      uploadTask.errorMessage = "";
-      renderUploadPanel();
-
-      try {
-        const uploadPayload = await uploadFileWithChecksum(uploadTask, destinationPath);
-        uploadTask.uploadedItemPath = uploadPayload.item ? uploadPayload.item.path : "";
-        uploadTask.uploadProgress = 100;
-        uploadTask.status = "done";
-        renderUploadPanel();
-        return;
-      } catch (error) {
-        uploadTask.errorMessage = error.message;
-        if (!shouldRetryUpload(error, uploadTask.attemptCount)) {
-          uploadTask.status = "failed";
-          renderUploadPanel();
-          return;
-        }
-
-        uploadTask.status = "retrying";
-        renderUploadPanel();
-        await sleep(getUploadRetryDelay(uploadTask.attemptCount));
-      }
-    }
-  }
-
-  async function calculateFileSha256(file, progressHandler) {
-    const hashInstance = await window.hashwasm.createSHA256();
-    hashInstance.init();
-
-    let processedBytes = 0;
-    while (processedBytes < file.size) {
-      const nextChunkEnd = Math.min(processedBytes + HASH_CHUNK_SIZE, file.size);
-      const fileChunk = file.slice(processedBytes, nextChunkEnd);
-      const chunkBuffer = await fileChunk.arrayBuffer();
-      hashInstance.update(new Uint8Array(chunkBuffer));
-      processedBytes = nextChunkEnd;
-      progressHandler(file.size ? Math.round((processedBytes / file.size) * 100) : 100);
-    }
-
-    if (file.size === 0) {
-      progressHandler(100);
-    }
-    return hashInstance.digest();
-  }
-
-  function uploadFileWithChecksum(uploadTask, destinationPath) {
-    // XMLHttpRequest is used instead of fetch because it provides upload progress events.
-    // FormData carries the file, the browser-computed SHA-256 digest, and the relative path.
-    return new Promise((resolveUpload, rejectUpload) => {
-      const formData = new FormData();
-      formData.append("file", uploadTask.file, uploadTask.relativePath);
-      formData.append("relativePath", uploadTask.relativePath);
-      formData.append("sha256", uploadTask.expectedSha256);
-      formData.append("size", String(uploadTask.file.size));
-
-      const uploadRequest = new XMLHttpRequest();
-      uploadRequest.open("POST", `/api/upload?path=${encodePath(destinationPath)}`);
-
-      uploadRequest.upload.onprogress = progressEvent => {
-        if (!progressEvent.lengthComputable) return;
-        uploadTask.uploadProgress = Math.round((progressEvent.loaded / progressEvent.total) * 100);
-        renderUploadPanel();
-      };
-
-      uploadRequest.onload = () => {
-        let responsePayload = {};
-        try {
-          responsePayload = JSON.parse(uploadRequest.responseText || "{}");
-        } catch (ignoredError) {}
-
-        if (uploadRequest.status >= 200 && uploadRequest.status < 300 && responsePayload.ok) {
-          resolveUpload(responsePayload);
-          return;
-        }
-
-        const uploadError = new Error(responsePayload.error || uploadRequest.statusText || "Upload failed");
-        uploadError.code = responsePayload.code || "upload_failed";
-        uploadError.status = uploadRequest.status;
-        uploadError.expectedSha256 = responsePayload.expectedSha256 || uploadTask.expectedSha256;
-        uploadError.actualSha256 = responsePayload.actualSha256 || "";
-        rejectUpload(uploadError);
-      };
-
-      uploadRequest.onerror = () => {
-        const uploadError = new Error("Network error: the upload was interrupted");
-        uploadError.code = "network_error";
-        uploadError.status = 0;
-        rejectUpload(uploadError);
-      };
-
-      uploadRequest.onabort = () => {
-        const uploadError = new Error("Upload was aborted");
-        uploadError.code = "upload_aborted";
-        uploadError.status = 0;
-        rejectUpload(uploadError);
-      };
-
-      uploadRequest.send(formData);
-    });
-  }
-
-  function shouldRetryUpload(uploadError, attemptCount) {
-    // Hash mismatches are treated as retryable because weak networks can corrupt or truncate requests.
-    // The same retry limit is used for all retryable failures to avoid an endless loop.
-    if (uploadError.code === "hash_mismatch") {
-      return attemptCount < UPLOAD_RETRY_LIMIT;
-    }
-    if (uploadError.status === 0 || uploadError.status >= 500) {
-      return attemptCount < UPLOAD_RETRY_LIMIT;
-    }
-    return false;
-  }
-
-  function getUploadRetryDelay(attemptCount) {
-    return Math.min(RETRY_DELAY_BASE_MS * attemptCount, RETRY_DELAY_MAX_MS);
-  }
-
-  function sleep(delayMilliseconds) {
-    return new Promise(resolveSleep => setTimeout(resolveSleep, delayMilliseconds));
-  }
-
-  function renderUploadPanel() {
-    if (!visibleUploadTasks.length) {
-      uploadPanel.classList.remove("show");
-      return;
-    }
-
-    const completedTaskCount = visibleUploadTasks.filter(uploadTask => uploadTask.status === "done").length;
-    const failedTaskCount = visibleUploadTasks.filter(uploadTask => uploadTask.status === "failed").length;
-    const runningTaskCount = visibleUploadTasks.filter(uploadTask => ["hashing", "uploading", "retrying"].includes(uploadTask.status)).length;
-
-    uploadPanel.classList.add("show");
-    uploadPanelTitle.textContent = "Upload Queue";
-    uploadPanelSummary.textContent = `${completedTaskCount}/${visibleUploadTasks.length} complete, ${runningTaskCount} running, ${failedTaskCount} failed`;
-    uploadTaskList.innerHTML = "";
-
-    for (const uploadTask of visibleUploadTasks) {
-      const taskElement = document.createElement("div");
-      taskElement.className = "upload-task";
-      const statusLabel = getUploadStatusLabel(uploadTask);
-      const progressPercent = uploadTask.status === "hashing" ? uploadTask.hashProgress : uploadTask.uploadProgress;
-      taskElement.innerHTML = `
-        <div class="upload-task-name" title="${escapeHtml(uploadTask.relativePath)}">${escapeHtml(uploadTask.relativePath)}</div>
-        <div class="upload-task-meta">
-          <span>${statusLabel}</span>
-          <span>${formatFileSize(uploadTask.file.size)}</span>
-        </div>
-        <div class="upload-progress-track">
-          <div class="upload-progress-bar" style="width: ${Math.max(0, Math.min(100, progressPercent))}%"></div>
-        </div>`;
-      uploadTaskList.appendChild(taskElement);
-    }
-  }
-
-  function getUploadStatusLabel(uploadTask) {
-    if (uploadTask.status === "pending") return "Waiting";
-    if (uploadTask.status === "hashing") return `Calculating SHA-256 ${uploadTask.hashProgress}%`;
-    if (uploadTask.status === "uploading") return `Uploading ${uploadTask.uploadProgress}% - attempt ${uploadTask.attemptCount}`;
-    if (uploadTask.status === "retrying") return `Verification or transport failed. Retrying after attempt ${uploadTask.attemptCount}`;
-    if (uploadTask.status === "done") return "Saved and verified";
-    if (uploadTask.status === "failed") return uploadTask.errorMessage || "Upload failed";
-    return uploadTask.status;
-  }
-
-  async function createDirectory() {
-    const directoryName = prompt("Folder name");
-    if (!directoryName) return;
-
-    await requestJsonOrThrow("/api/mkdir", {
+  async function mkdir() {
+    const name = prompt("文件夹名称");
+    if (!name) return;
+    await api("/api/mkdir", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: currentPath, name: directoryName })
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ path: currentPath, name })
     });
-    await loadDirectory(currentPath);
+    await load(currentPath);
   }
-
-  async function renameItem(itemPath) {
-    const currentName = itemPath.split("/").pop();
-    const newName = prompt("New name", currentName);
-    if (!newName || newName === currentName) return;
-
-    await requestJsonOrThrow("/api/rename", {
+  async function renameItem(path) {
+    const current = path.split("/").pop();
+    const name = prompt("新名称", current);
+    if (!name || name === current) return;
+    await api("/api/rename", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: itemPath, name: newName })
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ path, name })
     });
-    await loadDirectory(currentPath);
+    await load(currentPath);
   }
-
-  async function deleteSelectedItems() {
-    const itemPaths = getSelectedPathList();
-    if (!itemPaths.length) return;
-    if (!confirm(`Delete ${itemPaths.length} selected item(s)?`)) return;
-
-    await requestJsonOrThrow("/api/delete", {
+  async function deleteSelected() {
+    const paths = selectedPaths();
+    if (!paths.length) return;
+    if (!confirm(`确认删除 ${paths.length} 项？`)) return;
+    await api("/api/delete", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: itemPaths })
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ items: paths })
     });
-    await loadDirectory(currentPath);
-    showToast("Delete complete");
+    await load(currentPath);
+    showToast("删除完成");
   }
-
-  function downloadSingleFile(itemPath) {
-    window.location.href = `/api/download?path=${encodePath(itemPath)}`;
+  function downloadOne(path) {
+    window.location.href = `/api/download?path=${qs(path)}`;
   }
-
-  async function downloadSelectedItems() {
-    const itemPaths = getSelectedPathList();
-    if (!itemPaths.length) return;
-
-    if (itemPaths.length === 1) {
-      const matchingItem = currentItems.find(itemRecord => itemRecord.path === itemPaths[0]);
-      if (matchingItem && matchingItem.type === "file") {
-        downloadSingleFile(itemPaths[0]);
+  async function downloadSelected() {
+    const paths = selectedPaths();
+    if (!paths.length) return;
+    if (paths.length === 1) {
+      const it = items.find(x => x.path === paths[0]);
+      if (it && it.type === "file") {
+        downloadOne(paths[0]);
         return;
       }
     }
-
-    showToast("Creating 7z archive on disk...");
-    const archivePayload = await requestJsonOrThrow("/api/archive", {
+    showToast("正在用 7z 最大压缩，请稍等...");
+    const res = await fetch("/api/download", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: itemPaths })
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ items: paths })
     });
-    window.location.href = archivePayload.downloadUrl;
-    showToast("Download started");
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("content-disposition") || "";
+    let name = "download.7z";
+    const m = cd.match(/filename\*?=(?:UTF-8''|\")?([^\";]+)/i);
+    if (m) name = decodeURIComponent(m[1].replace(/\"/g, ""));
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showToast("下载已开始");
   }
 
-  // Drag moving and drag uploading.
-  function handleDragStart(dragEvent, itemRecord) {
-    if (!selectedPaths.has(itemRecord.path)) {
-      selectedPaths.clear();
-      selectedPaths.add(itemRecord.path);
+  function onDragStart(ev, item) {
+    if (!selected.has(item.path)) {
+      selected.clear();
+      selected.add(item.path);
       syncSelectionView();
     }
-
-    dragEvent.dataTransfer.effectAllowed = "move";
-    dragEvent.dataTransfer.setData("application/x-file-manager-items", JSON.stringify(getSelectedPathList()));
-    dragEvent.dataTransfer.setData("text/plain", getSelectedPathList().join("\n"));
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData("application/x-file-manager-items", JSON.stringify(selectedPaths()));
+    ev.dataTransfer.setData("text/plain", selectedPaths().join("\n"));
   }
-
-  function handleDestinationDragOver(dragEvent) {
-    const hasInternalItems = dragEvent.dataTransfer.types.includes("application/x-file-manager-items");
-    const hasExternalFiles = dragEvent.dataTransfer.files.length > 0;
-    if (!hasInternalItems && !hasExternalFiles) return;
-
-    dragEvent.preventDefault();
-    dragEvent.currentTarget.classList.add("drop-target");
-    dragEvent.dataTransfer.dropEffect = hasExternalFiles ? "copy" : "move";
-  }
-
-  async function handleDrop(dropEvent, destinationPath) {
-    dropEvent.preventDefault();
-    closeContextMenu();
-
-    const internalPayload = dropEvent.dataTransfer.getData("application/x-file-manager-items");
-    try {
-      if (internalPayload) {
-        const itemPaths = JSON.parse(internalPayload);
-        await moveItemsToDirectory(itemPaths, destinationPath);
-        return;
-      }
-
-      if (dropEvent.dataTransfer.files && dropEvent.dataTransfer.files.length) {
-        await uploadFileList(dropEvent.dataTransfer.files, destinationPath, false);
-      }
-    } catch (error) {
-      showToast(error.message);
+  function onDragOverDest(ev) {
+    if (ev.dataTransfer.types.includes("application/x-file-manager-items") || ev.dataTransfer.files.length) {
+      ev.preventDefault();
+      ev.currentTarget.classList.add("drop-target");
+      ev.dataTransfer.dropEffect = ev.dataTransfer.files.length ? "copy" : "move";
     }
   }
-
-  async function moveItemsToDirectory(itemPaths, destinationPath) {
-    await requestJsonOrThrow("/api/move", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ items: itemPaths, dest: destinationPath })
-    });
-    await loadDirectory(currentPath);
-    showToast("Move complete");
-  }
-
-  workspace.addEventListener("dragover", dragEvent => {
-    if (!dragEvent.dataTransfer.files || !dragEvent.dataTransfer.files.length) return;
-    dragEvent.preventDefault();
-    dragEvent.dataTransfer.dropEffect = "copy";
-  });
-
-  workspace.addEventListener("drop", async dropEvent => {
-    if (dropEvent.target.closest(".file-row") || dropEvent.target.closest(".breadcrumb-item")) return;
-    if (!dropEvent.dataTransfer.files || !dropEvent.dataTransfer.files.length) return;
-
-    dropEvent.preventDefault();
-    await uploadFileList(dropEvent.dataTransfer.files, currentPath, false);
-  });
-
-  // Rectangle selection works in any drag direction.
-  let selectionBoxElement = null;
-  let selectionStartPoint = null;
-
-  workspace.addEventListener("pointerdown", pointerEvent => {
-    const clickedFileRow = pointerEvent.target.closest(".file-row");
-    const clickedMenu = pointerEvent.target.closest(".context-menu");
-    if (pointerEvent.button !== 0 || clickedFileRow || clickedMenu) return;
-
-    closeContextMenu();
-    selectionStartPoint = { x: pointerEvent.clientX, y: pointerEvent.clientY };
-    selectionBoxElement = document.createElement("div");
-    selectionBoxElement.className = "selection-box";
-    document.body.appendChild(selectionBoxElement);
-    selectedPaths.clear();
-    syncSelectionView();
-    workspace.setPointerCapture(pointerEvent.pointerId);
-    pointerEvent.preventDefault();
-  });
-
-  workspace.addEventListener("pointermove", pointerEvent => {
-    if (!selectionBoxElement || !selectionStartPoint) return;
-
-    const left = Math.min(selectionStartPoint.x, pointerEvent.clientX);
-    const top = Math.min(selectionStartPoint.y, pointerEvent.clientY);
-    const right = Math.max(selectionStartPoint.x, pointerEvent.clientX);
-    const bottom = Math.max(selectionStartPoint.y, pointerEvent.clientY);
-
-    selectionBoxElement.style.left = `${left}px`;
-    selectionBoxElement.style.top = `${top}px`;
-    selectionBoxElement.style.width = `${right - left}px`;
-    selectionBoxElement.style.height = `${bottom - top}px`;
-
-    selectedPaths.clear();
-    fileTableBody.querySelectorAll(".file-row").forEach(rowElement => {
-      const rowRectangle = rowElement.getBoundingClientRect();
-      const intersectsSelection = !(
-        rowRectangle.right < left ||
-        rowRectangle.left > right ||
-        rowRectangle.bottom < top ||
-        rowRectangle.top > bottom
-      );
-      if (intersectsSelection) {
-        selectedPaths.add(rowElement.dataset.path);
-      }
-    });
-    syncSelectionView();
-  });
-
-  workspace.addEventListener("pointerup", pointerEvent => {
-    if (!selectionBoxElement) return;
-
-    selectionBoxElement.remove();
-    selectionBoxElement = null;
-    selectionStartPoint = null;
+  async function handleDrop(ev, destPath) {
+    ev.preventDefault();
+    closeMenu();
+    const internal = ev.dataTransfer.getData("application/x-file-manager-items");
     try {
-      workspace.releasePointerCapture(pointerEvent.pointerId);
-    } catch (ignoredError) {}
+      if (internal) {
+        const paths = JSON.parse(internal);
+        await api("/api/move", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ items: paths, dest: destPath })
+        });
+        await load(currentPath);
+        showToast("移动完成");
+      } else if (ev.dataTransfer.files && ev.dataTransfer.files.length) {
+        await uploadFileList(ev.dataTransfer.files, destPath, false);
+      }
+    } catch (e) { showToast(e.message); }
+  }
+  main.addEventListener("dragover", (ev) => {
+    if (ev.dataTransfer.files && ev.dataTransfer.files.length) {
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = "copy";
+    }
+  });
+  main.addEventListener("drop", async (ev) => {
+    if (ev.target.closest(".row") || ev.target.closest(".crumb")) return;
+    if (ev.dataTransfer.files && ev.dataTransfer.files.length) {
+      ev.preventDefault();
+      await uploadFileList(ev.dataTransfer.files, currentPath, false);
+    }
   });
 
-  loadDirectory("");
+  // 框选：从任意方向拖都可以，例如右下向左上。
+  let box = null;
+  let boxStart = null;
+  main.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0 || ev.target.closest(".row") || ev.target.closest(".crumb") || ev.target.closest(".menu")) return;
+    closeMenu();
+    boxStart = { x: ev.clientX, y: ev.clientY };
+    box = document.createElement("div");
+    box.className = "selection-box";
+    document.body.appendChild(box);
+    selected.clear();
+    syncSelectionView();
+    main.setPointerCapture(ev.pointerId);
+    ev.preventDefault();
+  });
+  main.addEventListener("pointermove", (ev) => {
+    if (!box || !boxStart) return;
+    const x1 = Math.min(boxStart.x, ev.clientX), y1 = Math.min(boxStart.y, ev.clientY);
+    const x2 = Math.max(boxStart.x, ev.clientX), y2 = Math.max(boxStart.y, ev.clientY);
+    Object.assign(box.style, {
+      left: x1 + "px", top: y1 + "px", width: (x2 - x1) + "px", height: (y2 - y1) + "px"
+    });
+    const boxRect = { left: x1, top: y1, right: x2, bottom: y2 };
+    selected.clear();
+    fileList.querySelectorAll(".row").forEach(row => {
+      const r = row.getBoundingClientRect();
+      const hit = !(r.right < boxRect.left || r.left > boxRect.right || r.bottom < boxRect.top || r.top > boxRect.bottom);
+      if (hit) selected.add(row.dataset.path);
+    });
+    syncSelectionView();
+  });
+  main.addEventListener("pointerup", (ev) => {
+    if (!box) return;
+    box.remove();
+    box = null;
+    boxStart = null;
+    try { main.releasePointerCapture(ev.pointerId); } catch (_) {}
+  });
+
+  load("");
 })();
 </script>
 </body>
 </html>
 '''
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+
+app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
