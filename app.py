@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Single-file Flask Cloud Drive (final version)
+Single-file Flask Cloud Drive
 =============================================
+Version: 1.4
 Overview:
     This is a single-file deployment version. Backend routes, HTML templates,
     CSS, and JavaScript are embedded in app.py. To deploy it, copy this file
@@ -11,11 +12,13 @@ Main features:
     - Login, registration, logout, and password changes.
     - Password digests stored with a random salt and SHA3-256.
     - Hierarchical folders, file/folder upload, listing, download, rename,
-      delete, and drag-and-drop move support.
-    - File/folder sharing, share management, and share cancellation.
+      delete, Ctrl/Cmd-click and marquee multi-select, and batch drag-and-drop move support.
+    - File/folder sharing, share management, share cancellation, and shared-page multi-select 7z download.
     - Shared folders are browsable; folder downloads generate temporary .7z
       files without loading the whole archive into memory.
     - Audio/video online playback.
+    - Image online viewing with fit-to-window, 100%, zoom in/out, including shared pages.
+    - Folder deduplication by SHA-256, keeping the oldest copy and pruning empty descendant folders.
     - Plain-text online editing; shared pages support read-only text viewing.
     - Text reading detects BOM and common encodings; saving tries to preserve
       the original encoding and newline style.
@@ -60,6 +63,7 @@ UPLOAD_DIR = DATA_DIR / "uploads"  # Directory for uploaded source files
 TMP_ARCHIVE_DIR = DATA_DIR / "tmp_archives"  # Temporary .7z archive directory
 DB_PATH = DATA_DIR / "drive.db"  # SQLite database file
 ARCHIVE_RETENTION_SECONDS = int(os.environ.get("ARCHIVE_RETENTION_SECONDS", 24 * 60 * 60))  # Temporary archive retention time
+APP_VERSION = "1.4"  # Visible application version
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)  # Create the data directory on first startup
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)  # Create the upload directory on first startup
@@ -103,6 +107,11 @@ app.config.update(
     SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
 )
 
+@app.context_processor
+def inject_app_version():
+    """Expose the visible application version to every embedded template."""
+    return {"app_version": APP_VERSION}
+
 # -----------------------------
 # Embedded templates and static assets
 # -----------------------------
@@ -113,14 +122,15 @@ TEMPLATE_FILES = {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}Cloud Drive{% endblock %}</title>
+  <title>{% block title %}Cloud Drive{% endblock %} · v{{ app_version }}</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
-  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v=app_version ~ '-image-viewer') }}">
 </head>
 <body>
   <main class="page-shell">
     {% block body %}{% endblock %}
   </main>
+  <span class="app-version" aria-label="Application version">v{{ app_version }}</span>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
   {% block scripts %}{% endblock %}
 </body>
@@ -209,8 +219,8 @@ TEMPLATE_FILES = {
 
   <section id="dropArea" class="file-board" aria-label="File List">
     {% for e in entries %}
-      <div class="entry-card {{ e.kind }}-entry" draggable="true" data-id="{{ e.id }}" data-kind="{{ e.kind }}" data-name="{{ e.name }}" data-media-kind="{{ media_kind(e.name) or '' }}" data-is-text="{{ '1' if is_text_file(e.name) else '0' }}">
-        <div class="entry-icon {{ e.kind }} {{ media_kind(e.name) or ('text' if is_text_file(e.name) else '') }}">{{ entry_icon(e.kind, e.name) }}</div>
+      <div class="entry-card {{ e.kind }}-entry" draggable="true" data-id="{{ e.id }}" data-kind="{{ e.kind }}" data-name="{{ e.name }}" data-media-kind="{{ media_kind(e.name) or '' }}" data-is-image="{{ '1' if is_image_file(e.name) else '0' }}" data-is-text="{{ '1' if is_text_file(e.name) else '0' }}">
+        <div class="entry-icon {{ e.kind }} {{ media_kind(e.name) or ('image' if is_image_file(e.name) else ('text' if is_text_file(e.name) else '')) }}">{{ entry_icon(e.kind, e.name) }}</div>
         <div class="entry-main">
           <div class="entry-name" title="{{ e.name }}">{{ e.name }}</div>
           <div class="entry-meta">
@@ -235,7 +245,7 @@ TEMPLATE_FILES = {
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js', v=app_version ~ '-image-viewer') }}"></script>
 {% endblock %}
 """,
     'media.html': r"""{% extends "base.html" %}
@@ -260,6 +270,36 @@ TEMPLATE_FILES = {
 </section>
 {% endblock %}
 """,
+    'image_view.html': r"""{% extends "base.html" %}
+{% block title %}View Image - {{ item.name }}{% endblock %}
+{% block body %}
+<section class="image-viewer-shell">
+  <header class="image-viewer-header">
+    <div class="image-viewer-title-area">
+      <h1 class="media-title">{{ item.name }}</h1>
+      <p class="media-meta">{{ kind_label(item.kind, item.name) }} · {{ file_size_label(item.size) }}</p>
+    </div>
+    <div class="image-viewer-actions" aria-label="Image controls">
+      <button id="imageFitButton" class="image-tool-button" type="button">Fit</button>
+      <button id="imageZoomOutButton" class="image-tool-button" type="button" aria-label="Zoom out">−</button>
+      <button id="imageActualButton" class="image-tool-button" type="button">100%</button>
+      <span id="imageZoomLabel" class="image-zoom-label" aria-live="polite">Fit</span>
+      <button id="imageZoomInButton" class="image-tool-button" type="button" aria-label="Zoom in">+</button>
+      <a class="mini-download" href="{{ download_url }}">Download</a>
+    </div>
+  </header>
+
+  <div id="imageViewport" class="image-viewer-viewport">
+    <div id="imageStage" class="image-viewer-stage">
+      <img id="viewedImage" class="viewed-image" src="{{ image_url }}" alt="{{ item.name }}" draggable="false">
+    </div>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='image_viewer.js', v=app_version) }}"></script>
+{% endblock %}
+""",
     'share_file.html': r"""{% extends "base.html" %}
 {% block title %}{{ item.name }}{% endblock %}
 {% block body %}
@@ -278,10 +318,12 @@ TEMPLATE_FILES = {
          data-name="{{ item.name }}"
          data-download-url="{{ url_for('share_download', token=token, item_id=item.id) }}"
          data-play-url="{{ url_for('share_preview', token=token, item_id=item.id) if media_kind(item.name) else '' }}"
+         data-image-url="{{ url_for('share_image_view', token=token, item_id=item.id) if is_image_file(item.name) else '' }}"
          data-text-url="{{ url_for('share_text_viewer', token=token, item_id=item.id) if is_text_file(item.name) else '' }}"
          data-media-kind="{{ media_kind(item.name) or '' }}"
+         data-is-image="{{ '1' if is_image_file(item.name) else '0' }}"
          data-is-text="{{ '1' if is_text_file(item.name) else '0' }}">
-      <div class="entry-icon file {{ media_kind(item.name) or ('text' if is_text_file(item.name) else '') }}">{{ entry_icon(item.kind, item.name) }}</div>
+      <div class="entry-icon file {{ media_kind(item.name) or ('image' if is_image_file(item.name) else ('text' if is_text_file(item.name) else '')) }}">{{ entry_icon(item.kind, item.name) }}</div>
       <div class="entry-main">
         <div class="entry-name" title="{{ item.name }}">{{ item.name }}</div>
         <div class="entry-meta"><span class="kind-badge file-badge">{{ kind_label(item.kind, item.name) }}</span><span>{{ file_size_label(item.size) }}</span></div>
@@ -293,7 +335,7 @@ TEMPLATE_FILES = {
 </section>
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', filename='share_page.js') }}"></script>
+<script src="{{ url_for('static', filename='share_page.js', v=app_version ~ '-image-viewer') }}"></script>
 {% endblock %}
 """,
     'share_folder.html': r"""{% extends "base.html" %}
@@ -330,10 +372,12 @@ TEMPLATE_FILES = {
            data-open-url="{{ url_for('share_view', token=token, folder_id=e.id) if e.kind == 'folder' else '' }}"
            data-download-url="{{ url_for('share_download', token=token, item_id=e.id) }}"
            data-play-url="{{ url_for('share_preview', token=token, item_id=e.id) if media_kind(e.name) else '' }}"
+           data-image-url="{{ url_for('share_image_view', token=token, item_id=e.id) if is_image_file(e.name) else '' }}"
            data-text-url="{{ url_for('share_text_viewer', token=token, item_id=e.id) if is_text_file(e.name) else '' }}"
            data-media-kind="{{ media_kind(e.name) or '' }}"
+           data-is-image="{{ '1' if is_image_file(e.name) else '0' }}"
            data-is-text="{{ '1' if is_text_file(e.name) else '0' }}">
-        <div class="entry-icon {{ e.kind }} {{ media_kind(e.name) or ('text' if is_text_file(e.name) else '') }}">{{ entry_icon(e.kind, e.name) }}</div>
+        <div class="entry-icon {{ e.kind }} {{ media_kind(e.name) or ('image' if is_image_file(e.name) else ('text' if is_text_file(e.name) else '')) }}">{{ entry_icon(e.kind, e.name) }}</div>
         <div class="entry-main">
           <div class="entry-name" title="{{ e.name }}">{{ e.name }}</div>
           <div class="entry-meta">
@@ -354,7 +398,7 @@ TEMPLATE_FILES = {
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', filename='share_page.js') }}"></script>
+<script src="{{ url_for('static', filename='share_page.js', v=app_version ~ '-image-viewer') }}"></script>
 {% endblock %}
 """,
     'shares.html': r"""{% extends "base.html" %}
@@ -381,7 +425,7 @@ TEMPLATE_FILES = {
       {% set share_url = url_for('share_view', token=s.token, _external=True) %}
       <article class="share-row" data-share-id="{{ s.id }}" data-share-url="{{ share_url }}">
         <div class="share-row-main">
-          <div class="entry-icon {{ s.kind }} {{ media_kind(s.name) or '' }}">{{ entry_icon(s.kind, s.name) }}</div>
+          <div class="entry-icon {{ s.kind }} {{ media_kind(s.name) or ('image' if is_image_file(s.name) else '') }}">{{ entry_icon(s.kind, s.name) }}</div>
           <div class="share-info">
             <div class="entry-name" title="{{ s.name }}">{{ s.name }}</div>
             <div class="entry-meta">
@@ -405,7 +449,7 @@ TEMPLATE_FILES = {
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', filename='shares.js') }}"></script>
+<script src="{{ url_for('static', filename='shares.js', v=app_version) }}"></script>
 {% endblock %}
 """,
     'text_editor.html': r"""{% extends "base.html" %}
@@ -435,7 +479,7 @@ TEMPLATE_FILES = {
 </section>
 {% endblock %}
 {% block scripts %}
-<script src="{{ url_for('static', filename='text_editor.js') }}"></script>
+<script src="{{ url_for('static', filename='text_editor.js', v=app_version) }}"></script>
 {% endblock %}
 """,
 }
@@ -483,6 +527,22 @@ a:hover {
 .page-shell {
   min-height: 100vh;
   padding: 0;
+}
+
+.app-version {
+  position: fixed;
+  right: 10px;
+  bottom: 7px;
+  z-index: 4000;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .72);
+  color: rgba(83, 51, 34, .72);
+  box-shadow: 0 2px 10px rgba(83, 51, 34, .08);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.35;
+  pointer-events: none;
 }
 
 .auth-layout {
@@ -690,6 +750,28 @@ a:hover {
   box-shadow: 0 18px 42px rgba(118, 77, 40, .12);
 }
 
+.entry-card.selected {
+  box-shadow:
+    0 18px 42px rgba(118, 77, 40, .12),
+    inset 0 0 0 2px rgba(234, 132, 57, .72);
+}
+
+.selection-marquee {
+  position: fixed;
+  z-index: 1400;
+  display: none;
+  pointer-events: none;
+  border: 1px solid rgba(201, 102, 34, .72);
+  border-radius: 8px;
+  background: rgba(234, 132, 57, .14);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .55) inset;
+}
+
+body.marquee-selecting {
+  cursor: crosshair;
+  user-select: none;
+}
+
 .entry-card.dragging {
   opacity: .45;
 }
@@ -697,12 +779,12 @@ a:hover {
 /* Compact square icons for files and folders. */
 .entry-icon {
   flex: 0 0 auto;
-  width: 58px;
-  height: 58px;
+  width: 54px;
+  height: 54px;
   display: grid;
   place-items: center;
-  border-radius: 10px;
-  font-size: 1.72rem;
+  border-radius: 9px;
+  font-size: 1.58rem;
   background: linear-gradient(135deg, rgba(255, 224, 196, .95), rgba(255, 194, 142, .72));
 }
 
@@ -712,6 +794,7 @@ a:hover {
 
 .entry-icon.audio,
 .entry-icon.video,
+.entry-icon.image,
 .entry-icon.text {
   background: linear-gradient(135deg, #ffe5d7, #ffae8a);
 }
@@ -785,7 +868,8 @@ a:hover {
   display: block;
 }
 
-.context-menu button {
+.context-menu button,
+.context-menu a {
   display: block;
   width: 100%;
   border: 0;
@@ -794,11 +878,13 @@ a:hover {
   background: transparent;
   color: var(--text-main);
   text-align: left;
+  text-decoration: none;
   font: inherit;
   font-size: .94rem;
 }
 
-.context-menu button:hover {
+.context-menu button:hover,
+.context-menu a:hover {
   background: var(--orange-50);
   color: var(--orange-600);
 }
@@ -961,6 +1047,119 @@ a:hover {
   min-height: 34vh;
 }
 
+.image-viewer-shell {
+  box-sizing: border-box;
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px clamp(10px, 1.4vw, 18px) 8px;
+  overflow: hidden;
+}
+
+.image-viewer-header {
+  flex: 0 0 auto;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.image-viewer-title-area {
+  min-width: 0;
+}
+
+.image-viewer-title-area .media-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-viewer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.image-tool-button {
+  min-width: 36px;
+  min-height: 28px;
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, .72);
+  color: #5d3521;
+  font: inherit;
+  font-size: .86rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.image-tool-button:hover {
+  background: rgba(255, 230, 205, .92);
+  color: #9c4310;
+}
+
+.image-zoom-label {
+  min-width: 54px;
+  text-align: center;
+  color: var(--muted);
+  font-size: .82rem;
+  font-weight: 800;
+}
+
+.image-viewer-viewport {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: 24px;
+  background: rgba(32, 25, 21, .94);
+  scrollbar-gutter: stable both-edges;
+}
+
+.image-viewer-stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  min-width: 100%;
+  min-height: 100%;
+  padding: 20px;
+}
+
+.viewed-image {
+  display: block;
+  max-width: none;
+  max-height: none;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  box-shadow: 0 10px 36px rgba(0, 0, 0, .28);
+}
+
+@media (max-width: 720px) {
+  .image-viewer-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .image-viewer-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .image-viewer-stage {
+    padding: 10px;
+  }
+}
+
 .single-shared-file-board {
   flex: initial;
   min-height: 170px;
@@ -1108,6 +1307,131 @@ a:hover {
   }
 }
 """,
+    'image_viewer.js': r"""(() => {
+  const image = document.getElementById('viewedImage');
+  const viewport = document.getElementById('imageViewport');
+  const stage = document.getElementById('imageStage');
+  const fitButton = document.getElementById('imageFitButton');
+  const actualButton = document.getElementById('imageActualButton');
+  const zoomOutButton = document.getElementById('imageZoomOutButton');
+  const zoomInButton = document.getElementById('imageZoomInButton');
+  const zoomLabel = document.getElementById('imageZoomLabel');
+  if (!image || !viewport || !stage) return;
+
+  const MIN_SCALE = 0.10;
+  const MAX_SCALE = 8.00;
+  const STEP = 1.20;
+  let scale = 1;
+  let fitMode = true;
+
+  function clampScale(value) {
+    return Math.min(MAX_SCALE, Math.max(MIN_SCALE, value));
+  }
+
+  function paddingSize() {
+    const style = getComputedStyle(stage);
+    return {
+      x: (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0),
+      y: (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0),
+    };
+  }
+
+  function calculateFitScale() {
+    if (!image.naturalWidth || !image.naturalHeight) return 1;
+    const padding = paddingSize();
+    const availableWidth = Math.max(1, viewport.clientWidth - padding.x);
+    const availableHeight = Math.max(1, viewport.clientHeight - padding.y);
+    // Automatically scale the image up or down to fit the available viewport.
+    return Math.min(availableWidth / image.naturalWidth, availableHeight / image.naturalHeight);
+  }
+
+  function updateLabel() {
+    if (!zoomLabel) return;
+    zoomLabel.textContent = fitMode ? `Fit · ${Math.round(scale * 100)}%` : `${Math.round(scale * 100)}%`;
+  }
+
+  function renderScale(nextScale, keepCenter = true) {
+    if (!image.naturalWidth || !image.naturalHeight) return;
+
+    const oldScrollWidth = stage.scrollWidth || viewport.clientWidth;
+    const oldScrollHeight = stage.scrollHeight || viewport.clientHeight;
+    const centerRatioX = oldScrollWidth > 0 ? (viewport.scrollLeft + viewport.clientWidth / 2) / oldScrollWidth : .5;
+    const centerRatioY = oldScrollHeight > 0 ? (viewport.scrollTop + viewport.clientHeight / 2) / oldScrollHeight : .5;
+
+    scale = clampScale(nextScale);
+    const padding = paddingSize();
+    const displayWidth = Math.max(1, Math.round(image.naturalWidth * scale));
+    const displayHeight = Math.max(1, Math.round(image.naturalHeight * scale));
+
+    image.style.width = `${displayWidth}px`;
+    image.style.height = `${displayHeight}px`;
+    stage.style.width = `${Math.max(viewport.clientWidth, displayWidth + padding.x)}px`;
+    stage.style.height = `${Math.max(viewport.clientHeight, displayHeight + padding.y)}px`;
+    updateLabel();
+
+    if (keepCenter) {
+      requestAnimationFrame(() => {
+        viewport.scrollLeft = Math.max(0, centerRatioX * stage.scrollWidth - viewport.clientWidth / 2);
+        viewport.scrollTop = Math.max(0, centerRatioY * stage.scrollHeight - viewport.clientHeight / 2);
+      });
+    }
+  }
+
+  function fitToWindow(keepCenter = false) {
+    fitMode = true;
+    renderScale(calculateFitScale(), keepCenter);
+    if (!keepCenter) {
+      viewport.scrollLeft = 0;
+      viewport.scrollTop = 0;
+    }
+  }
+
+  function setActualSize() {
+    fitMode = false;
+    renderScale(1, true);
+  }
+
+  function zoomBy(factor) {
+    fitMode = false;
+    renderScale(scale * factor, true);
+  }
+
+  fitButton?.addEventListener('click', () => fitToWindow(false));
+  actualButton?.addEventListener('click', setActualSize);
+  zoomOutButton?.addEventListener('click', () => zoomBy(1 / STEP));
+  zoomInButton?.addEventListener('click', () => zoomBy(STEP));
+
+  image.addEventListener('dblclick', () => {
+    if (fitMode) setActualSize();
+    else fitToWindow(false);
+  });
+
+  viewport.addEventListener('wheel', (event) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    zoomBy(event.deltaY < 0 ? STEP : 1 / STEP);
+  }, { passive: false });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === '+' || event.key === '=') zoomBy(STEP);
+    else if (event.key === '-') zoomBy(1 / STEP);
+    else if (event.key === '0') setActualSize();
+    else if (event.key.toLowerCase() === 'f') fitToWindow(false);
+  });
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (fitMode) fitToWindow(false);
+      else renderScale(scale, true);
+    }, 80);
+  });
+
+  if (image.complete && image.naturalWidth) fitToWindow(false);
+  else image.addEventListener('load', () => fitToWindow(false), { once: true });
+})();
+""",
     'app.js': r"""const shell = document.querySelector('.drive-shell');
 const currentFolderId = shell?.dataset.currentFolderId || '';
 const board = document.getElementById('dropArea');
@@ -1116,17 +1440,57 @@ const fileInput = document.getElementById('fileInput');
 const folderInput = document.getElementById('folderInput');
 const toastHost = document.getElementById('toastHost');
 let activeEntry = null;
-let dragEntryId = null;
+let dragEntryIds = [];
 let suppressNextClick = false;
+let marqueeState = null;
+let multiSelectionMode = false;
+const selectedEntryIds = new Set();
 
-// Context-menu preview/edit actions should not replace the file list page.
-function openInNewTab(url) {
-  const openedWindow = window.open(url, '_blank', 'noopener');
-  if (openedWindow) {
-    openedWindow.opener = null;
-    return;
-  }
-  showToast('The browser blocked the new tab. Please allow pop-ups and try again.', 4200);
+function entryCards() {
+  return board ? Array.from(board.querySelectorAll('.entry-card[data-id]')) : [];
+}
+
+function selectedEntries() {
+  return entryCards().filter(entry => selectedEntryIds.has(entry.dataset.id));
+}
+
+function selectedIds() {
+  return selectedEntries().map(entry => entry.dataset.id);
+}
+
+function syncSelectionClasses() {
+  entryCards().forEach(entry => {
+    entry.classList.toggle('selected', selectedEntryIds.has(entry.dataset.id));
+    entry.setAttribute('aria-selected', selectedEntryIds.has(entry.dataset.id) ? 'true' : 'false');
+  });
+}
+
+function replaceSelection(ids) {
+  selectedEntryIds.clear();
+  for (const id of ids) selectedEntryIds.add(String(id));
+  syncSelectionClasses();
+}
+
+function clearSelection() {
+  multiSelectionMode = false;
+  replaceSelection([]);
+}
+
+function selectOnlyEntry(entry) {
+  multiSelectionMode = false;
+  replaceSelection([entry.dataset.id]);
+}
+
+function toggleEntrySelection(entry) {
+  multiSelectionMode = true;
+  const id = entry.dataset.id;
+  if (selectedEntryIds.has(id)) selectedEntryIds.delete(id);
+  else selectedEntryIds.add(id);
+  syncSelectionClasses();
+}
+
+function isAdditiveSelectionEvent(event) {
+  return event.ctrlKey || event.metaKey;
 }
 
 function api(url, body) {
@@ -1192,6 +1556,29 @@ async function prepareArchiveDownload(prepareUrl) {
   }
 }
 
+async function prepareSelectedArchiveDownload(itemIds) {
+  const overlay = showArchiveWaitingOverlay('Compressing selected items, please wait...');
+  try {
+    const response = await fetch('/api/prepare_download_selected', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({ item_ids: itemIds })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false || !data.url) {
+      throw new Error(data.error || 'Compression failed. Please try again later.');
+    }
+    showToast('Compression complete. Starting download.');
+    triggerBrowserDownload(data.url);
+  } finally {
+    hideArchiveWaitingOverlay(overlay);
+  }
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -1211,9 +1598,9 @@ async function copyText(text) {
 }
 
 function closeMenu() {
+  if (!menu) return;
   menu.classList.remove('show');
   menu.innerHTML = '';
-  document.querySelectorAll('.entry-card.selected').forEach(el => el.classList.remove('selected'));
 }
 
 function placeMenu(x, y) {
@@ -1238,6 +1625,16 @@ function addMenuItem(label, action, danger = false) {
   menu.appendChild(btn);
 }
 
+function addMenuLink(label, url) {
+  const link = document.createElement('a');
+  link.textContent = label;
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.addEventListener('click', () => closeMenu());
+  menu.appendChild(link);
+}
+
 function entryMainAction(entry) {
   const id = entry.dataset.id;
   if (entry.dataset.kind === 'folder') {
@@ -1247,25 +1644,68 @@ function entryMainAction(entry) {
   }
 }
 
+function openMultiEntryMenu(entries, x, y) {
+  closeMenu();
+  activeEntry = null;
+  const ids = entries.map(entry => entry.dataset.id);
+  const count = ids.length;
+
+  // Selection-mode context menu intentionally contains only these two actions.
+  addMenuItem('Download as 7z', () => prepareSelectedArchiveDownload(ids));
+  addMenuItem('Delete Files', async () => {
+    if (!confirm(`Delete the ${count} selected item${count === 1 ? '' : 's'}?`)) return;
+    await api('/api/delete', { item_ids: ids });
+    location.reload();
+  }, true);
+  placeMenu(x, y);
+}
+
 function openEntryMenu(entry, x, y) {
   closeMenu();
+  const entryWasSelected = selectedEntryIds.has(entry.dataset.id);
+  if (!entryWasSelected) selectOnlyEntry(entry);
+
+  const currentSelection = selectedEntries();
+  // Ctrl/Cmd-click or marquee selection stays in selection mode even when one item remains.
+  // In that mode the context menu must not expose Rename or Share.
+  if (currentSelection.length > 1 || (entryWasSelected && multiSelectionMode && currentSelection.length > 0)) {
+    openMultiEntryMenu(currentSelection, x, y);
+    return;
+  }
+
   activeEntry = entry;
-  entry.classList.add('selected');
   const id = entry.dataset.id;
   const kind = entry.dataset.kind;
   const name = entry.dataset.name;
   const mediaKind = entry.dataset.mediaKind;
+  const isImageFile = entry.dataset.isImage === '1';
   const isTextFile = entry.dataset.isText === '1';
 
   if (kind === 'folder') {
     addMenuItem('Open', () => { window.location.href = `/drive/${id}`; });
     addMenuItem('Download as 7z', () => prepareArchiveDownload(`/api/prepare_download/${id}`));
+    addMenuItem('Deduplicate', async () => {
+      const overlay = showArchiveWaitingOverlay('Scanning hashes and removing duplicate files...');
+      try {
+        const result = await api('/api/deduplicate_folder', { folder_id: id });
+        let message = `Deduplication complete: scanned ${result.files_scanned} file(s), deleted ${result.duplicate_files_deleted} duplicate file(s), removed ${result.empty_folders_deleted} empty folder(s), freed ${result.bytes_freed_label}.`;
+        if (result.files_skipped) {
+          message += ` ${result.files_skipped} file(s) could not be processed and were left unchanged.`;
+        }
+        showToast(message, 9000);
+      } finally {
+        hideArchiveWaitingOverlay(overlay);
+      }
+    }, true);
   } else {
     if (mediaKind === 'audio' || mediaKind === 'video') {
-      addMenuItem('Play Online', () => { openInNewTab(`/preview/${id}`); });
+      addMenuLink('Play Online', `/preview/${id}`);
+    }
+    if (isImageFile) {
+      addMenuLink('View Image', `/image/${id}`);
     }
     if (isTextFile) {
-      addMenuItem('Edit Text Online', () => { openInNewTab(`/text/${id}`); });
+      addMenuLink('Edit Text Online', `/text/${id}`);
     }
     addMenuItem('Download', () => { window.location.href = `/download/${id}`; });
   }
@@ -1297,6 +1737,7 @@ function openEntryMenu(entry, x, y) {
 
 function openBlankMenu(x, y) {
   closeMenu();
+  clearSelection();
   activeEntry = null;
   addMenuItem('Upload Files', () => fileInput.click());
   addMenuItem('Upload Folder', () => folderInput.click());
@@ -1316,7 +1757,72 @@ function shouldOpenBlankMenu(target) {
   return !target.closest('.entry-card') && !target.closest('.context-menu') && target.closest('#dropArea');
 }
 
+function rectanglesIntersect(a, b) {
+  return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
+}
+
+function updateMarqueeSelection(clientX, clientY) {
+  if (!marqueeState) return;
+  const left = Math.min(marqueeState.startX, clientX);
+  const top = Math.min(marqueeState.startY, clientY);
+  const right = Math.max(marqueeState.startX, clientX);
+  const bottom = Math.max(marqueeState.startY, clientY);
+  const width = right - left;
+  const height = bottom - top;
+
+  marqueeState.box.style.display = 'block';
+  marqueeState.box.style.left = `${left}px`;
+  marqueeState.box.style.top = `${top}px`;
+  marqueeState.box.style.width = `${width}px`;
+  marqueeState.box.style.height = `${height}px`;
+
+  const selectionRect = { left, top, right, bottom };
+  const nextSelection = new Set(marqueeState.additive ? marqueeState.baseSelection : []);
+  for (const entry of entryCards()) {
+    if (rectanglesIntersect(selectionRect, entry.getBoundingClientRect())) {
+      nextSelection.add(entry.dataset.id);
+    }
+  }
+  replaceSelection(nextSelection);
+}
+
+function finishMarquee(event, cancelled = false) {
+  if (!marqueeState || event.pointerId !== marqueeState.pointerId) return;
+  const state = marqueeState;
+  marqueeState = null;
+
+  if (cancelled) replaceSelection(state.baseSelection);
+  state.box.remove();
+  document.body.classList.remove('marquee-selecting');
+  try { board.releasePointerCapture(event.pointerId); } catch (_err) { /* capture may already be released */ }
+
+  if (state.moved) {
+    suppressNextClick = true;
+    setTimeout(() => { suppressNextClick = false; }, 120);
+  }
+}
+
+function draggedIdsFromEvent(event) {
+  const raw = event.dataTransfer?.getData('application/x-cloud-drive-item-ids');
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) return parsed.map(String);
+    } catch (_err) { /* use in-memory drag state below */ }
+  }
+  return dragEntryIds.slice();
+}
+
+async function moveDraggedItems(event, targetParentId) {
+  const itemIds = draggedIdsFromEvent(event);
+  if (!itemIds.length) return;
+  await api('/api/move', { item_ids: itemIds, target_parent_id: targetParentId });
+  location.reload();
+}
+
 if (board) {
+  syncSelectionClasses();
+
   document.addEventListener('contextmenu', (e) => {
     const entry = e.target.closest('.entry-card');
     if (entry && board.contains(entry)) {
@@ -1335,14 +1841,69 @@ if (board) {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeMenu();
+    if (e.key === 'Escape') {
+      closeMenu();
+      clearSelection();
+    }
   });
 
   board.addEventListener('click', (e) => {
+    if (suppressNextClick) return;
     const entry = e.target.closest('.entry-card');
-    if (!entry || suppressNextClick) return;
+    if (!entry) {
+      clearSelection();
+      return;
+    }
+
+    if (isAdditiveSelectionEvent(e)) {
+      e.preventDefault();
+      toggleEntrySelection(entry);
+      return;
+    }
+
+    if (!selectedEntryIds.has(entry.dataset.id) || selectedEntryIds.size > 1) clearSelection();
     entryMainAction(entry);
   });
+
+  board.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || e.pointerType !== 'mouse') return;
+    if (e.target.closest('.entry-card') || e.target.closest('.context-menu')) return;
+
+    closeMenu();
+    const additive = isAdditiveSelectionEvent(e);
+    const baseSelection = new Set(additive ? selectedEntryIds : []);
+    if (!additive) clearSelection();
+
+    const box = document.createElement('div');
+    box.className = 'selection-marquee';
+    document.body.appendChild(box);
+    marqueeState = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: false,
+      additive,
+      baseSelection,
+      box
+    };
+    document.body.classList.add('marquee-selecting');
+    board.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+
+  board.addEventListener('pointermove', (e) => {
+    if (!marqueeState || e.pointerId !== marqueeState.pointerId) return;
+    const dx = Math.abs(e.clientX - marqueeState.startX);
+    const dy = Math.abs(e.clientY - marqueeState.startY);
+    if (!marqueeState.moved && Math.max(dx, dy) < 4) return;
+    marqueeState.moved = true;
+    multiSelectionMode = true;
+    updateMarqueeSelection(e.clientX, e.clientY);
+    e.preventDefault();
+  });
+
+  board.addEventListener('pointerup', (e) => finishMarquee(e));
+  board.addEventListener('pointercancel', (e) => finishMarquee(e, true));
 
   async function uploadFiles(fileList, isFolder = false) {
     const files = Array.from(fileList || []);
@@ -1373,22 +1934,25 @@ if (board) {
 
   document.querySelectorAll('.entry-card[draggable="true"]').forEach(entry => {
     entry.addEventListener('dragstart', (e) => {
-      dragEntryId = entry.dataset.id;
-      entry.classList.add('dragging');
+      if (!selectedEntryIds.has(entry.dataset.id)) selectOnlyEntry(entry);
+      dragEntryIds = selectedIds();
+      selectedEntries().forEach(selected => selected.classList.add('dragging'));
+      closeMenu();
       e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', dragEntryId);
+      e.dataTransfer.setData('application/x-cloud-drive-item-ids', JSON.stringify(dragEntryIds));
+      e.dataTransfer.setData('text/plain', dragEntryIds[0] || entry.dataset.id);
     });
     entry.addEventListener('dragend', () => {
-      dragEntryId = null;
+      dragEntryIds = [];
       suppressNextClick = true;
       setTimeout(() => { suppressNextClick = false; }, 120);
-      entry.classList.remove('dragging');
+      document.querySelectorAll('.entry-card.dragging').forEach(el => el.classList.remove('dragging'));
       document.querySelectorAll('.drop-over').forEach(el => el.classList.remove('drop-over'));
     });
 
     if (entry.dataset.kind === 'folder') {
       entry.addEventListener('dragover', (e) => {
-        if (!dragEntryId || dragEntryId === entry.dataset.id) return;
+        if (!dragEntryIds.length || dragEntryIds.includes(entry.dataset.id)) return;
         e.preventDefault();
         entry.classList.add('drop-over');
       });
@@ -1396,11 +1960,10 @@ if (board) {
       entry.addEventListener('drop', async (e) => {
         e.preventDefault();
         entry.classList.remove('drop-over');
-        const itemId = e.dataTransfer.getData('text/plain') || dragEntryId;
-        if (!itemId || itemId === entry.dataset.id) return;
+        const itemIds = draggedIdsFromEvent(e);
+        if (!itemIds.length || itemIds.includes(entry.dataset.id)) return;
         try {
-          await api('/api/move', { item_id: itemId, target_parent_id: entry.dataset.id });
-          location.reload();
+          await moveDraggedItems(e, entry.dataset.id);
         } catch (err) { showToast(err.message || String(err)); }
       });
     }
@@ -1408,7 +1971,7 @@ if (board) {
 
   document.querySelectorAll('.breadcrumb-target').forEach(crumb => {
     crumb.addEventListener('dragover', (e) => {
-      if (!dragEntryId) return;
+      if (!dragEntryIds.length) return;
       e.preventDefault();
       crumb.classList.add('drop-over');
     });
@@ -1416,16 +1979,14 @@ if (board) {
     crumb.addEventListener('drop', async (e) => {
       e.preventDefault();
       crumb.classList.remove('drop-over');
-      const itemId = e.dataTransfer.getData('text/plain') || dragEntryId;
       try {
-        await api('/api/move', { item_id: itemId, target_parent_id: crumb.dataset.folderId || '' });
-        location.reload();
+        await moveDraggedItems(e, crumb.dataset.folderId || '');
       } catch (err) { showToast(err.message || String(err)); }
     });
   });
 
   board.addEventListener('dragover', (e) => {
-    if (!dragEntryId) return;
+    if (!dragEntryIds.length) return;
     if (e.target.closest('.entry-card')) return;
     e.preventDefault();
     board.classList.add('drop-over');
@@ -1436,32 +1997,65 @@ if (board) {
   });
 
   board.addEventListener('drop', async (e) => {
-    if (!dragEntryId) return;
+    if (!dragEntryIds.length) return;
     if (e.target.closest('.entry-card')) return;
     e.preventDefault();
     board.classList.remove('drop-over');
-    const itemId = e.dataTransfer.getData('text/plain') || dragEntryId;
     try {
-      await api('/api/move', { item_id: itemId, target_parent_id: currentFolderId });
-      location.reload();
+      await moveDraggedItems(e, currentFolderId);
     } catch (err) { showToast(err.message || String(err)); }
   });
 }
+
 """,
     'share_page.js': r"""const sharedFileBoard = document.getElementById('sharedFileBoard');
 const sharedContextMenu = document.getElementById('sharedContextMenu');
 const sharedArchiveLink = document.querySelector('[data-shared-archive-link]');
 const sharedShell = document.querySelector('[data-share-token]');
 const shareToken = sharedShell?.dataset.shareToken || '';
-let selectedSharedEntry = null;
+const selectedSharedEntryIds = new Set();
+let sharedMarqueeState = null;
+let suppressNextSharedClick = false;
 
-function openInNewTab(url) {
-  const openedWindow = window.open(url, '_blank', 'noopener');
-  if (openedWindow) {
-    openedWindow.opener = null;
-    return;
-  }
-  alert('The browser blocked the new tab. Please allow pop-ups and try again.');
+function sharedEntryCards() {
+  return sharedFileBoard ? Array.from(sharedFileBoard.querySelectorAll('.shared-entry[data-id]')) : [];
+}
+
+function selectedSharedEntries() {
+  return sharedEntryCards().filter((entryElement) => selectedSharedEntryIds.has(entryElement.dataset.id));
+}
+
+function syncSharedSelectionClasses() {
+  sharedEntryCards().forEach((entryElement) => {
+    const isSelected = selectedSharedEntryIds.has(entryElement.dataset.id);
+    entryElement.classList.toggle('selected', isSelected);
+    entryElement.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+  });
+}
+
+function replaceSharedSelection(itemIds) {
+  selectedSharedEntryIds.clear();
+  for (const itemId of itemIds) selectedSharedEntryIds.add(String(itemId));
+  syncSharedSelectionClasses();
+}
+
+function clearSharedSelection() {
+  replaceSharedSelection([]);
+}
+
+function selectOnlySharedEntry(entryElement) {
+  replaceSharedSelection([entryElement.dataset.id]);
+}
+
+function toggleSharedEntrySelection(entryElement) {
+  const itemId = entryElement.dataset.id;
+  if (selectedSharedEntryIds.has(itemId)) selectedSharedEntryIds.delete(itemId);
+  else selectedSharedEntryIds.add(itemId);
+  syncSharedSelectionClasses();
+}
+
+function isAdditiveSharedSelectionEvent(event) {
+  return event.ctrlKey || event.metaKey;
 }
 
 function showSharedArchiveWaitingOverlay(message) {
@@ -1500,12 +2094,31 @@ async function prepareSharedArchiveDownload(prepareUrl) {
   }
 }
 
+async function prepareSharedSelectedArchiveDownload(itemIds) {
+  const overlay = showSharedArchiveWaitingOverlay('Compressing selected items, please wait...');
+  try {
+    const response = await fetch(`/api/s/${encodeURIComponent(shareToken)}/prepare_download_selected`, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({ item_ids: itemIds })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false || !data.url) {
+      throw new Error(data.error || 'Compression failed. Please try again later.');
+    }
+    triggerSharedBrowserDownload(data.url);
+  } finally {
+    overlay.remove();
+  }
+}
+
 function closeSharedContextMenu() {
   sharedContextMenu?.classList.remove('show');
   if (sharedContextMenu) sharedContextMenu.innerHTML = '';
-  document.querySelectorAll('.shared-entry.selected').forEach((entryElement) => {
-    entryElement.classList.remove('selected');
-  });
 }
 
 function positionSharedContextMenu(clientX, clientY) {
@@ -1534,6 +2147,16 @@ function addSharedMenuItem(label, action, isDangerous = false) {
   sharedContextMenu.appendChild(menuButton);
 }
 
+function addSharedMenuLink(label, url) {
+  const menuLink = document.createElement('a');
+  menuLink.textContent = label;
+  menuLink.href = url;
+  menuLink.target = '_blank';
+  menuLink.rel = 'noopener noreferrer';
+  menuLink.addEventListener('click', () => closeSharedContextMenu());
+  sharedContextMenu.appendChild(menuLink);
+}
+
 function openSharedEntry(entryElement) {
   if (entryElement.dataset.kind === 'folder') {
     window.location.href = entryElement.dataset.openUrl;
@@ -1542,10 +2165,22 @@ function openSharedEntry(entryElement) {
   window.location.href = entryElement.dataset.downloadUrl;
 }
 
+function openSharedMultiEntryMenu(entryElements, clientX, clientY) {
+  closeSharedContextMenu();
+  const itemIds = entryElements.map((entryElement) => entryElement.dataset.id);
+  addSharedMenuItem('Download as 7z', () => prepareSharedSelectedArchiveDownload(itemIds));
+  positionSharedContextMenu(clientX, clientY);
+}
+
 function openSharedEntryMenu(entryElement, clientX, clientY) {
   closeSharedContextMenu();
-  selectedSharedEntry = entryElement;
-  selectedSharedEntry.classList.add('selected');
+  if (!selectedSharedEntryIds.has(entryElement.dataset.id)) selectOnlySharedEntry(entryElement);
+
+  const currentSelection = selectedSharedEntries();
+  if (currentSelection.length > 1) {
+    openSharedMultiEntryMenu(currentSelection, clientX, clientY);
+    return;
+  }
 
   if (entryElement.dataset.kind === 'folder') {
     addSharedMenuItem('Open', () => { window.location.href = entryElement.dataset.openUrl; });
@@ -1553,14 +2188,63 @@ function openSharedEntryMenu(entryElement, clientX, clientY) {
   } else {
     addSharedMenuItem('Download', () => { window.location.href = entryElement.dataset.downloadUrl; });
     if (entryElement.dataset.playUrl) {
-      addSharedMenuItem('Play Online', () => { openInNewTab(entryElement.dataset.playUrl); });
+      addSharedMenuLink('Play Online', entryElement.dataset.playUrl);
+    }
+    if (entryElement.dataset.imageUrl) {
+      addSharedMenuLink('View Image', entryElement.dataset.imageUrl);
     }
     if (entryElement.dataset.textUrl) {
-      addSharedMenuItem('View Text Online', () => { openInNewTab(entryElement.dataset.textUrl); });
+      addSharedMenuLink('View Text Online', entryElement.dataset.textUrl);
     }
   }
 
   positionSharedContextMenu(clientX, clientY);
+}
+
+function sharedRectanglesIntersect(firstRectangle, secondRectangle) {
+  return firstRectangle.left <= secondRectangle.right
+    && firstRectangle.right >= secondRectangle.left
+    && firstRectangle.top <= secondRectangle.bottom
+    && firstRectangle.bottom >= secondRectangle.top;
+}
+
+function updateSharedMarqueeSelection(clientX, clientY) {
+  if (!sharedMarqueeState) return;
+  const left = Math.min(sharedMarqueeState.startX, clientX);
+  const top = Math.min(sharedMarqueeState.startY, clientY);
+  const right = Math.max(sharedMarqueeState.startX, clientX);
+  const bottom = Math.max(sharedMarqueeState.startY, clientY);
+
+  sharedMarqueeState.box.style.display = 'block';
+  sharedMarqueeState.box.style.left = `${left}px`;
+  sharedMarqueeState.box.style.top = `${top}px`;
+  sharedMarqueeState.box.style.width = `${right - left}px`;
+  sharedMarqueeState.box.style.height = `${bottom - top}px`;
+
+  const selectionRectangle = { left, top, right, bottom };
+  const nextSelection = new Set(sharedMarqueeState.additive ? sharedMarqueeState.baseSelection : []);
+  for (const entryElement of sharedEntryCards()) {
+    if (sharedRectanglesIntersect(selectionRectangle, entryElement.getBoundingClientRect())) {
+      nextSelection.add(entryElement.dataset.id);
+    }
+  }
+  replaceSharedSelection(nextSelection);
+}
+
+function finishSharedMarquee(event, cancelled = false) {
+  if (!sharedMarqueeState || event.pointerId !== sharedMarqueeState.pointerId) return;
+  const state = sharedMarqueeState;
+  sharedMarqueeState = null;
+
+  if (cancelled) replaceSharedSelection(state.baseSelection);
+  state.box.remove();
+  document.body.classList.remove('marquee-selecting');
+  try { sharedFileBoard.releasePointerCapture(event.pointerId); } catch (_error) { /* capture may already be released */ }
+
+  if (state.moved) {
+    suppressNextSharedClick = true;
+    setTimeout(() => { suppressNextSharedClick = false; }, 120);
+  }
 }
 
 if (sharedArchiveLink) {
@@ -1571,11 +2255,66 @@ if (sharedArchiveLink) {
 }
 
 if (sharedFileBoard && sharedContextMenu) {
+  syncSharedSelectionClasses();
+
   sharedFileBoard.addEventListener('click', (event) => {
+    if (suppressNextSharedClick) return;
     const entryElement = event.target.closest('.shared-entry');
-    if (!entryElement || !sharedFileBoard.contains(entryElement)) return;
+    if (!entryElement || !sharedFileBoard.contains(entryElement)) {
+      clearSharedSelection();
+      return;
+    }
+
+    if (isAdditiveSharedSelectionEvent(event)) {
+      event.preventDefault();
+      toggleSharedEntrySelection(entryElement);
+      return;
+    }
+
+    if (!selectedSharedEntryIds.has(entryElement.dataset.id) || selectedSharedEntryIds.size > 1) {
+      clearSharedSelection();
+    }
     openSharedEntry(entryElement);
   });
+
+  sharedFileBoard.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || event.pointerType !== 'mouse') return;
+    if (event.target.closest('.shared-entry') || event.target.closest('.context-menu')) return;
+
+    closeSharedContextMenu();
+    const additive = isAdditiveSharedSelectionEvent(event);
+    const baseSelection = new Set(additive ? selectedSharedEntryIds : []);
+    if (!additive) clearSharedSelection();
+
+    const box = document.createElement('div');
+    box.className = 'selection-marquee';
+    document.body.appendChild(box);
+    sharedMarqueeState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      moved: false,
+      additive,
+      baseSelection,
+      box
+    };
+    document.body.classList.add('marquee-selecting');
+    sharedFileBoard.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+
+  sharedFileBoard.addEventListener('pointermove', (event) => {
+    if (!sharedMarqueeState || event.pointerId !== sharedMarqueeState.pointerId) return;
+    const horizontalDistance = Math.abs(event.clientX - sharedMarqueeState.startX);
+    const verticalDistance = Math.abs(event.clientY - sharedMarqueeState.startY);
+    if (!sharedMarqueeState.moved && Math.max(horizontalDistance, verticalDistance) < 4) return;
+    sharedMarqueeState.moved = true;
+    updateSharedMarqueeSelection(event.clientX, event.clientY);
+    event.preventDefault();
+  });
+
+  sharedFileBoard.addEventListener('pointerup', (event) => finishSharedMarquee(event));
+  sharedFileBoard.addEventListener('pointercancel', (event) => finishSharedMarquee(event, true));
 
   document.addEventListener('contextmenu', (event) => {
     const entryElement = event.target.closest('.shared-entry');
@@ -1589,7 +2328,10 @@ if (sharedFileBoard && sharedContextMenu) {
   });
 
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') closeSharedContextMenu();
+    if (event.key === 'Escape') {
+      closeSharedContextMenu();
+      clearSharedSelection();
+    }
   });
 }
 """,
@@ -1730,7 +2472,12 @@ def embedded_static(filename: str):
     if content is None:
         abort(404)
     mimetype = mimetypes.guess_type(filename)[0] or "text/plain"
-    return Response(content, mimetype=mimetype)
+    response = Response(content, mimetype=mimetype)
+    # Embedded assets change together with this single file; prevent stale browser JS/CSS.
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 AUDIO_EXTS = {
@@ -1738,6 +2485,9 @@ AUDIO_EXTS = {
 }
 VIDEO_EXTS = {
     ".mp4", ".webm", ".ogv", ".mov", ".m4v", ".mkv", ".avi"
+}
+IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".ico"
 }
 TEXT_EXTS = {
     ".txt", ".text", ".md", ".markdown", ".log", ".csv", ".tsv",
@@ -1887,6 +2637,10 @@ def media_kind(name: str | None) -> str | None:
     return None
 
 
+def is_image_file(name: str | None) -> bool:
+    return Path(name or "").suffix.lower() in IMAGE_EXTS
+
+
 def is_text_file(name: str | None) -> bool:
     name = name or ""
     if Path(name).suffix.lower() in TEXT_EXTS:
@@ -1903,6 +2657,8 @@ def entry_icon(kind: str, name: str | None = None) -> str:
         return "🎵"
     if m == "video":
         return "🎬"
+    if is_image_file(name):
+        return "🖼️"
     if is_text_file(name):
         return "📝"
     return "📄"
@@ -1916,6 +2672,8 @@ def kind_label(kind: str, name: str | None = None) -> str:
         return "Audio File"
     if m == "video":
         return "Video File"
+    if is_image_file(name):
+        return "Image File"
     if is_text_file(name):
         return "Text File"
     return "File"
@@ -1954,6 +2712,7 @@ def newline_style_label(newline_style: str) -> str:
 def inject_template_helpers():
     return {
         "media_kind": media_kind,
+        "is_image_file": is_image_file,
         "is_text_file": is_text_file,
         "entry_icon": entry_icon,
         "kind_label": kind_label,
@@ -2288,6 +3047,43 @@ def create_7z_archive(row) -> Path:
         marker_path.unlink(missing_ok=True)
     return archive_path
 
+
+def create_7z_archive_for_rows(rows) -> Path:
+    """Create one 7z containing every selected file/folder at the archive root."""
+    archive_path = TMP_ARCHIVE_DIR / f"{uuid.uuid4().hex}.7z"
+    marker_paths = []
+
+    try:
+        with py7zr.SevenZipFile(archive_path, "w", filters=archive_filters()) as archive:
+            for row in rows:
+                if row["kind"] == "file":
+                    source_path = file_path(row)
+                    if source_path.exists():
+                        archive.write(source_path, arcname=str(PurePosixPath(row["name"])))
+                    continue
+
+                folder_written = 0
+                for file_row, rel in iter_file_rows(int(row["id"])):
+                    source_path = file_path(file_row)
+                    if not source_path.exists():
+                        continue
+                    archive.write(source_path, arcname=str(PurePosixPath(rel)))
+                    folder_written += 1
+
+                if folder_written == 0:
+                    marker_path = TMP_ARCHIVE_DIR / f"{uuid.uuid4().hex}.txt"
+                    marker_path.write_text("This folder currently has no files.\n", encoding="utf-8")
+                    marker_paths.append(marker_path)
+                    archive.write(
+                        marker_path,
+                        arcname=str(PurePosixPath(row["name"]) / "empty-folder-note.txt"),
+                    )
+    finally:
+        for marker_path in marker_paths:
+            marker_path.unlink(missing_ok=True)
+
+    return archive_path
+
 def is_valid_archive_id(archive_id: str) -> bool:
     """Only allow random hex names generated by create_7z_archive()."""
     if len(archive_id) != 32:
@@ -2298,6 +3094,16 @@ def prepared_archive_json(row):
     """Generate a folder archive first, then return the ready download URL to JavaScript."""
     archive_path = create_7z_archive(row)
     download_name = f"{row['name']}.7z"
+    return jsonify(
+        ok=True,
+        url=url_for("prepared_archive_download", archive_id=archive_path.stem, name=download_name),
+    )
+
+
+def prepared_selected_archive_json(rows):
+    """Generate one archive for a multi-selection and return its download URL."""
+    archive_path = create_7z_archive_for_rows(rows)
+    download_name = f"selected-{len(rows)}-items.7z"
     return jsonify(
         ok=True,
         url=url_for("prepared_archive_download", archive_id=archive_path.stem, name=download_name),
@@ -2346,6 +3152,18 @@ def send_media_file(row):
         abort(404)
     mimetype = mimetypes.guess_type(row["name"])[0] or "application/octet-stream"
     return send_file(p, as_attachment=False, download_name=row["name"], mimetype=mimetype, conditional=True)
+
+
+def send_image_file(row):
+    if row["kind"] != "file" or not is_image_file(row["name"]):
+        abort(404)
+    p = file_path(row)
+    if not p.exists():
+        abort(404)
+    mimetype = mimetypes.guess_type(row["name"])[0] or "application/octet-stream"
+    response = send_file(p, as_attachment=False, download_name=row["name"], mimetype=mimetype, conditional=True)
+    response.headers.setdefault("Cache-Control", "private, max-age=3600")
+    return response
 
 def detect_bom_encoding(raw_content: bytes) -> str | None:
     if raw_content.startswith(b"\xef\xbb\xbf"):
@@ -2443,6 +3261,106 @@ def save_text_document(row, text_content: str, encoding_name: str, newline_style
     get_db().commit()
 
 
+def sha256_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
+    """Return a streaming SHA-256 digest without loading the whole file into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def prune_empty_descendant_folders(root_folder_id: int, owner_id: int) -> int:
+    """Delete empty folders below root_folder_id, but never delete the selected root itself."""
+    deleted = 0
+    for child in list(list_children(owner_id, root_folder_id)):
+        if child["kind"] != "folder":
+            continue
+        child_id = int(child["id"])
+        deleted += prune_empty_descendant_folders(child_id, owner_id)
+        still_has_children = get_db().execute(
+            "SELECT 1 FROM entries WHERE owner_id = ? AND parent_id = ? LIMIT 1",
+            (owner_id, child_id),
+        ).fetchone()
+        if not still_has_children:
+            get_db().execute(
+                "DELETE FROM entries WHERE id = ? AND owner_id = ? AND kind = 'folder'",
+                (child_id, owner_id),
+            )
+            deleted += 1
+    return deleted
+
+
+def deduplicate_folder_tree(folder_row) -> dict:
+    """Hash every file below a folder, delete later duplicates, then prune empty folders."""
+    if folder_row["kind"] != "folder":
+        raise ValueError("Deduplication is only available for folders.")
+
+    owner_id = int(folder_row["owner_id"])
+    root_id = int(folder_row["id"])
+    file_entries = list(iter_file_rows(root_id))
+    # Stable retention rule: the oldest database entry wins within each duplicate group.
+    file_entries.sort(key=lambda item: (item[0]["created_at"], int(item[0]["id"])))
+
+    seen_hashes: dict[str, int] = {}
+    duplicate_rows = []
+    files_scanned = 0
+    files_skipped = 0
+
+    for row, _relative_path in file_entries:
+        path = file_path(row)
+        if not path.is_file():
+            files_skipped += 1
+            continue
+        try:
+            digest = sha256_file(path)
+        except OSError:
+            files_skipped += 1
+            continue
+
+        files_scanned += 1
+        if digest in seen_hashes:
+            duplicate_rows.append(row)
+        else:
+            seen_hashes[digest] = int(row["id"])
+
+    deleted_ids = []
+    bytes_freed = 0
+    for row in duplicate_rows:
+        path = file_path(row)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Keep the database row if its storage file could not be deleted.
+            files_skipped += 1
+            continue
+        deleted_ids.append(int(row["id"]))
+        bytes_freed += int(row["size"] or 0)
+
+    if deleted_ids:
+        placeholders = ",".join("?" for _ in deleted_ids)
+        get_db().execute(
+            f"DELETE FROM entries WHERE owner_id = ? AND id IN ({placeholders})",
+            (owner_id, *deleted_ids),
+        )
+        get_db().commit()
+
+    empty_folders_deleted = prune_empty_descendant_folders(root_id, owner_id)
+    get_db().commit()
+
+    return {
+        "files_scanned": files_scanned,
+        "files_skipped": files_skipped,
+        "duplicate_files_deleted": len(deleted_ids),
+        "empty_folders_deleted": empty_folders_deleted,
+        "bytes_freed": bytes_freed,
+        "bytes_freed_label": file_size_label(bytes_freed),
+    }
+
+
 def delete_storage_under(entry_id: int):
     row = get_entry(entry_id)
     if not row:
@@ -2507,6 +3425,25 @@ def preview(item_id):
 def media_stream(item_id):
     row = require_owned_entry(item_id)
     return send_media_file(row)
+
+
+@app.route("/image/<int:item_id>")
+def image_view(item_id):
+    row = require_owned_entry(item_id)
+    if not is_image_file(row["name"]):
+        abort(404)
+    return render_template(
+        "image_view.html",
+        item=row,
+        image_url=url_for("image_stream", item_id=item_id),
+        download_url=url_for("download", item_id=item_id),
+    )
+
+
+@app.route("/image-data/<int:item_id>")
+def image_stream(item_id):
+    row = require_owned_entry(item_id)
+    return send_image_file(row)
 
 @app.route("/text/<int:item_id>")
 def text_editor(item_id):
@@ -2607,36 +3544,92 @@ def api_rename():
     )
     get_db().commit()
     return jsonify(ok=True, name=new_name)
+def requested_item_ids(data) -> list[int]:
+    """Accept one item_id or a de-duplicated item_ids list for batch actions."""
+    raw_ids = data.get("item_ids")
+    if raw_ids is None:
+        raw_ids = [data.get("item_id")]
+    elif not isinstance(raw_ids, list):
+        raw_ids = [raw_ids]
+
+    item_ids = []
+    seen = set()
+    for raw_id in raw_ids:
+        try:
+            item_id = int(raw_id)
+        except (TypeError, ValueError):
+            abort(400)
+        if item_id not in seen:
+            seen.add(item_id)
+            item_ids.append(item_id)
+
+    if not item_ids or len(item_ids) > 500:
+        abort(400)
+    return item_ids
+
+
+@app.post("/api/deduplicate_folder")
+def api_deduplicate_folder():
+    data = request.get_json(force=True)
+    try:
+        folder_id = int(data.get("folder_id"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="A valid folder_id is required."), 400
+
+    folder = require_owned_entry(folder_id)
+    if folder["kind"] != "folder":
+        return jsonify(ok=False, error="Deduplication is only available for folders."), 400
+
+    result = deduplicate_folder_tree(folder)
+    return jsonify(ok=True, **result)
+
+
 @app.post("/api/delete")
 def api_delete():
     data = request.get_json(force=True)
-    row = require_owned_entry(int(data.get("item_id")))
-    delete_storage_under(int(row["id"]))
-    get_db().execute("DELETE FROM entries WHERE id = ?", (row["id"],))
+    item_ids = requested_item_ids(data)
+    rows = [require_owned_entry(item_id) for item_id in item_ids]
+
+    for row in rows:
+        delete_storage_under(int(row["id"]))
+
+    placeholders = ",".join("?" for _ in item_ids)
+    get_db().execute(f"DELETE FROM entries WHERE id IN ({placeholders})", tuple(item_ids))
     get_db().commit()
-    return jsonify(ok=True)
+    return jsonify(ok=True, deleted=len(item_ids))
+
+
 @app.post("/api/move")
 def api_move():
     owner_id = current_user_id()
     data = request.get_json(force=True)
-    item = require_owned_entry(int(data.get("item_id")))
+    item_ids = requested_item_ids(data)
+    items = [require_owned_entry(item_id) for item_id in item_ids]
     target = require_folder_or_root(data.get("target_parent_id"))
     target_parent_id = int(target["id"]) if target else None
 
-    if item["kind"] == "folder" and target_parent_id is not None:
-        if int(item["id"]) == target_parent_id or is_descendant(target_parent_id, int(item["id"])):
-            return jsonify(ok=False, error="Cannot move a folder into itself or one of its subfolders."), 400
+    # Validate the entire batch before changing any item.
+    for item in items:
+        if item["kind"] == "folder" and target_parent_id is not None:
+            if int(item["id"]) == target_parent_id or is_descendant(target_parent_id, int(item["id"])):
+                return jsonify(ok=False, error="Cannot move a folder into itself or one of its subfolders."), 400
 
-    if item["parent_id"] == target_parent_id:
-        return jsonify(ok=True)
+    moved = 0
+    renamed = {}
+    for item in items:
+        if item["parent_id"] == target_parent_id:
+            continue
+        new_name = unique_name(owner_id, target_parent_id, item["name"], exclude_id=int(item["id"]))
+        get_db().execute(
+            "UPDATE entries SET parent_id = ?, name = ?, updated_at = ? WHERE id = ?",
+            (target_parent_id, new_name, now_iso(), item["id"]),
+        )
+        moved += 1
+        if new_name != item["name"]:
+            renamed[str(item["id"])] = new_name
 
-    new_name = unique_name(owner_id, target_parent_id, item["name"], exclude_id=int(item["id"]))
-    get_db().execute(
-        "UPDATE entries SET parent_id = ?, name = ?, updated_at = ? WHERE id = ?",
-        (target_parent_id, new_name, now_iso(), item["id"]),
-    )
     get_db().commit()
-    return jsonify(ok=True, name=new_name)
+    return jsonify(ok=True, moved=moved, renamed=renamed)
 
 
 @app.post("/api/share")
@@ -2676,6 +3669,14 @@ def api_prepare_download(item_id):
     if row["kind"] != "folder":
         return jsonify(ok=True, url=url_for("download", item_id=item_id))
     return prepared_archive_json(row)
+
+
+@app.post("/api/prepare_download_selected")
+def api_prepare_download_selected():
+    data = request.get_json(force=True)
+    item_ids = requested_item_ids(data)
+    rows = [require_owned_entry(item_id) for item_id in item_ids]
+    return prepared_selected_archive_json(rows)
 
 # -----------------------------
 # Shared pages
@@ -2768,6 +3769,26 @@ def share_prepare_archive_download(token, folder_id):
         abort(404)
     return prepared_archive_json(row)
 
+
+@app.post("/api/s/<token>/prepare_download_selected")
+def share_prepare_selected_archive_download(token):
+    """Create one 7z from items selected inside the current share scope."""
+    share = get_share(token)
+    root_id = int(share["item_id"])
+    data = request.get_json(force=True)
+    item_ids = requested_item_ids(data)
+    rows = []
+
+    for item_id in item_ids:
+        if not is_shared_descendant(item_id, root_id):
+            abort(403)
+        row = get_entry(item_id)
+        if not row:
+            abort(404)
+        rows.append(row)
+
+    return prepared_selected_archive_json(rows)
+
 @app.route("/s/<token>/preview/<int:item_id>")
 def share_preview(token, item_id):
     share = get_share(token)
@@ -2785,6 +3806,36 @@ def share_preview(token, item_id):
         stream_url=url_for("share_media_stream", token=token, item_id=item_id),
         download_url=url_for("share_download", token=token, item_id=item_id),
     )
+
+
+@app.route("/s/<token>/image/<int:item_id>")
+def share_image_view(token, item_id):
+    share = get_share(token)
+    root_id = int(share["item_id"])
+    if not is_shared_descendant(item_id, root_id):
+        abort(403)
+    row = get_entry(item_id)
+    if not row or not is_image_file(row["name"]):
+        abort(404)
+    return render_template(
+        "image_view.html",
+        item=row,
+        image_url=url_for("share_image_stream", token=token, item_id=item_id),
+        download_url=url_for("share_download", token=token, item_id=item_id),
+    )
+
+
+@app.route("/s/<token>/image-data/<int:item_id>")
+def share_image_stream(token, item_id):
+    share = get_share(token)
+    root_id = int(share["item_id"])
+    if not is_shared_descendant(item_id, root_id):
+        abort(403)
+    row = get_entry(item_id)
+    if not row:
+        abort(404)
+    return send_image_file(row)
+
 @app.route("/s/<token>/text/<int:item_id>")
 def share_text_viewer(token, item_id):
     share = get_share(token)
