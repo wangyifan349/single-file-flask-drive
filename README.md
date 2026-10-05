@@ -371,7 +371,7 @@ If this project helps you and you would like to say thanks, you can buy me a cof
 Bitcoin:
 
 ```text
-bc1qxqfhumpqtnxrznkx9r4xsp8m6zsedtgusjns7p
+bc1qwhzzk5tx07592vkf97rt8x8v0zdntad8lexnrgv3gdmecg8pfmhqzceedl
 ```
 
 ## 🧾 License
